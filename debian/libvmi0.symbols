@@ -15,6 +15,7 @@ libvmi-0.15.so libvmi #MINVER#
  tmp_str@Base 0.15
  vmi_are_events_pending@Base 0.15
  vmi_clear_event@Base 0.15
+ vmi_clone_reader@Base 0.15
  vmi_convert_str_encoding@Base 0.15
  vmi_destroy@Base 0.15
  vmi_dtb_to_pid@Base 0.15

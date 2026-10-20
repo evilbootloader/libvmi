@@ -1005,6 +1005,18 @@ vmi_destroy(
 
     vmi->shutting_down = TRUE;
 
+    if (vmi->reader_clone) {
+        /* The driver, OS and profile data belong to the parent */
+        pid_cache_destroy(vmi);
+        sym_cache_destroy(vmi);
+        rva_cache_destroy(vmi);
+        v2p_cache_destroy(vmi);
+        memory_cache_destroy(vmi);
+        g_rw_lock_clear(&vmi->events_lock);
+        g_free(vmi);
+        return VMI_SUCCESS;
+    }
+
     driver_destroy(vmi);
     events_destroy(vmi);
 
@@ -1030,6 +1042,83 @@ vmi_destroy(
     g_free(vmi->memmap);
     g_rw_lock_clear(&vmi->events_lock);
     g_free(vmi);
+    return VMI_SUCCESS;
+}
+
+status_t
+vmi_clone_reader(
+    vmi_instance_t parent,
+    vmi_instance_t *clone)
+{
+    if (!parent || !clone || parent->reader_clone)
+        return VMI_FAILURE;
+
+    /*
+     * Fields of the shared OS data that are only filled in on first use have
+     * to be resolved now, the clones must not write to it.
+     */
+    if (VMI_OS_WINDOWS == parent->os_type) {
+        addr_t unused;
+        vmi_get_offset(parent, "win_pname", &unused);
+    }
+
+    vmi_instance_t _vmi = (vmi_instance_t) g_try_malloc0(sizeof(struct vmi_instance));
+    if ( !_vmi )
+        return VMI_FAILURE;
+
+    /* Driver handles, OS data, profiles and the memory map are shared read-only */
+    *_vmi = *parent;
+    _vmi->reader_clone = TRUE;
+    _vmi->init_flags &= ~(VMI_INIT_EVENTS | VMI_INIT_DOMAINWATCH);
+    _vmi->last_pagetable_lookup_fault.valid = false;
+
+    /* A clone has no events */
+    _vmi->guest_requested_event = NULL;
+    _vmi->cpuid_event = NULL;
+    _vmi->debug_event = NULL;
+    _vmi->privcall_event = NULL;
+    _vmi->descriptor_access_event = NULL;
+    _vmi->failed_emulation_event = NULL;
+    _vmi->watch_domain_event = NULL;
+    _vmi->vmexit_event = NULL;
+    _vmi->io_event = NULL;
+    _vmi->interrupt_events = NULL;
+    _vmi->mem_events_on_gfn = NULL;
+    _vmi->mem_events_generic = NULL;
+    _vmi->reg_events = NULL;
+    _vmi->msr_events = NULL;
+    _vmi->ss_events = NULL;
+    _vmi->step_events = NULL;
+    memset(_vmi->step_vcpus, 0, sizeof(_vmi->step_vcpus));
+    _vmi->event_callback = 0;
+    _vmi->clear_events = NULL;
+    _vmi->swap_events = NULL;
+    _vmi->parallel_events = FALSE;
+    g_rw_lock_init(&_vmi->events_lock);
+
+    /* Each clone has its own caches */
+    _vmi->pid_cache = NULL;
+    _vmi->sym_cache = NULL;
+    _vmi->rva_cache = NULL;
+    _vmi->v2p_cache = NULL;
+    pid_cache_init(_vmi);
+    sym_cache_init(_vmi);
+    rva_cache_init(_vmi);
+    v2p_cache_init(_vmi);
+
+#ifdef ENABLE_PAGE_CACHE
+    _vmi->memory_cache = NULL;
+    _vmi->memory_cache_lru = NULL;
+    memory_cache_init(_vmi, parent->get_data_callback, parent->release_data_callback,
+                      parent->memory_cache_age);
+    _vmi->memory_cache_size_max = parent->memory_cache_size_max;
+#else
+    _vmi->last_used_page = NULL;
+    _vmi->last_used_page_key = 0;
+    memory_cache_init(_vmi, parent->get_data_callback, parent->release_data_callback, 0);
+#endif
+
+    *clone = _vmi;
     return VMI_SUCCESS;
 }
 

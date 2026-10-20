@@ -967,6 +967,23 @@ status_t vmi_destroy(
     vmi_instance_t vmi) NOEXCEPT;
 
 /**
+ * Create an instance for reading memory from another thread.
+ *
+ * The clone shares the driver handles and the OS profile of the parent but has
+ * its own caches, so the parent and each clone can read memory concurrently as
+ * long as every instance is used by one thread at a time. The clone has no
+ * events. Clone after the OS of the parent is initialized and destroy all
+ * clones with vmi_destroy() before the parent.
+ *
+ * @param[in] parent Fully initialized LibVMI instance
+ * @param[out] clone The new instance
+ * @return VMI_SUCCESS or VMI_FAILURE
+ */
+status_t vmi_clone_reader(
+    vmi_instance_t parent,
+    vmi_instance_t *clone) NOEXCEPT;
+
+/**
  * Obtain the library arch mode that was used for compiling.
  *
  * @param[in] vmi LibVMI instance

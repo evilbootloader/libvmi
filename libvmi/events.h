@@ -850,7 +850,8 @@ status_t vmi_events_listen(
  * have been answered and no callback is running.
  *
  * Callbacks are responsible for their own locking. LibVMI does not make the
- * memory access functions safe to call concurrently on one instance.
+ * memory access functions safe to call concurrently on one instance, see
+ * vmi_clone_reader().
  *
  * Only supported on Xen with vm_event interface version 7. Must not be called
  * while vmi_events_listen() is running.

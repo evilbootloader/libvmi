@@ -216,6 +216,8 @@ struct vmi_instance {
     gboolean parallel_events; /**< events of each vCPU are processed on their own worker thread */
 
     GRWLock events_lock; /**< with parallel_events, protects the event tables and the deferred clear/swap requests */
+
+    gboolean reader_clone; /**< instance made by vmi_clone_reader, shares driver and OS data with its parent */
 };
 
 /*
