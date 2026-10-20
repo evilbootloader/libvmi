@@ -64,7 +64,7 @@ void v2p_cache_destroy(vmi_instance_t vmi);
 void v2p_cache_set(vmi_instance_t vmi, addr_t va, addr_t pt, addr_t npt, addr_t pa);
 void v2p_cache_flush(vmi_instance_t vmi, addr_t pt, addr_t npt);
 status_t v2p_cache_get(vmi_instance_t vmi, addr_t va, addr_t pt, addr_t npt, addr_t *pa);
-status_t v2p_cache_del(vmi_instance_t vmi, addr_t va, addr_t np, addr_t npt);
+status_t v2p_cache_del(vmi_instance_t vmi, addr_t va, addr_t pt, addr_t npt);
 
 #else
 

@@ -59,10 +59,48 @@ START_TEST (test_libvmi_cache)
 }
 END_TEST
 
+/* flushing the cached translations of one address space */
+START_TEST (test_libvmi_v2pcache_flush)
+{
+    vmi_instance_t vmi = NULL;
+    vmi_init_complete(&vmi, (void*)get_testvm(), VMI_INIT_DOMAINNAME, NULL,
+                      VMI_CONFIG_GLOBAL_FILE_ENTRY, NULL, NULL);
+
+    /*
+     * A translation in the cache is returned without walking the page
+     * tables, as long as its page is readable. The page tables don't map
+     * this address to the first page of the address space either.
+     */
+    addr_t dtb = 0, va = 0x7ffff0000000ull, cached = 0x1000, pa = 0;
+    ck_assert_msg(VMI_SUCCESS == vmi_get_vcpureg(vmi, &dtb, CR3, 0), "failed to read CR3");
+    dtb &= ~0xfffull;
+
+    vmi_v2pcache_flush(vmi, ~0ull);
+    vmi_v2pcache_add(vmi, va, dtb, cached);
+
+    status_t ret = vmi_pagetable_lookup(vmi, dtb, va, &pa);
+    ck_assert_msg(VMI_SUCCESS == ret && pa == cached, "translation added to the cache not used");
+
+    /* flushing another address space keeps it */
+    vmi_v2pcache_flush(vmi, dtb + 0x1000);
+    ret = vmi_pagetable_lookup(vmi, dtb, va, &pa);
+    ck_assert_msg(VMI_SUCCESS == ret && pa == cached, "translation flushed with another address space");
+
+    /* flushing its own address space drops it */
+    vmi_v2pcache_flush(vmi, dtb);
+    ret = vmi_pagetable_lookup(vmi, dtb, va, &pa);
+    ck_assert_msg(VMI_SUCCESS != ret || pa != cached, "translation not flushed with its address space");
+
+    vmi_v2pcache_flush(vmi, ~0ull);
+    vmi_destroy(vmi);
+}
+END_TEST
+
 /* cache test cases */
 TCase *cache_tcase (void)
 {
     TCase *tc_init = tcase_create("LibVMI cache");
     tcase_add_test(tc_init, test_libvmi_cache);
+    tcase_add_test(tc_init, test_libvmi_v2pcache_flush);
     return tc_init;
 }

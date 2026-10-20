@@ -600,7 +600,7 @@ v2p_cache_del(
 {
     struct key_128 local_key;
     key_128_t key = &local_key;
-    key_128_init(key, npt, pt);
+    key_128_init(key, pt, npt);
 
     GHashTable *v = g_hash_table_lookup(vmi->v2p_cache, key);
     if ( !v )
@@ -628,7 +628,7 @@ v2p_cache_flush(
     else {
         struct key_128 local_key;
         key_128_t key = &local_key;
-        key_128_init(key, npt, pt);
+        key_128_init(key, pt, npt);
         (void) g_hash_table_remove(vmi->v2p_cache, key);
     }
     dbprint(VMI_DEBUG_V2PCACHE, "--V2P cache flushed\n");

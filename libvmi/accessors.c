@@ -912,7 +912,7 @@ status_t vmi_pagetable_lookup_cache(
         if (VMI_SUCCESS == vmi_read_8_pa(vmi, *paddr, &value)) {
             return VMI_SUCCESS;
         } else {
-            if ( VMI_FAILURE == v2p_cache_del(vmi, vaddr, 0, pt) )
+            if ( VMI_FAILURE == v2p_cache_del(vmi, vaddr, pt, 0) )
                 return VMI_FAILURE;
         }
     }
