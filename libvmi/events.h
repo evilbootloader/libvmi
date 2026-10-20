@@ -840,6 +840,30 @@ status_t vmi_events_listen(
     uint32_t timeout) NOEXCEPT;
 
 /**
+ * Process the events of each vCPU on its own worker thread.
+ *
+ * Events of one vCPU are always delivered on the same worker thread and in
+ * order, events of different vCPUs are delivered concurrently. Each callback
+ * receives a private copy of the registered vmi_event_t, so changes made to
+ * the event structure inside a callback only affect that response.
+ * vmi_events_listen() returns only once all requests it took from the ring
+ * have been answered and no callback is running.
+ *
+ * Callbacks are responsible for their own locking. LibVMI does not make the
+ * memory access functions safe to call concurrently on one instance.
+ *
+ * Only supported on Xen with vm_event interface version 7. Must not be called
+ * while vmi_events_listen() is running.
+ *
+ * @param[in] vmi LibVMI instance
+ * @param[in] enable Start or stop the worker threads
+ * @return VMI_FAILURE or VMI_SUCCESS
+ */
+status_t vmi_events_set_parallel(
+    vmi_instance_t vmi,
+    bool enable) NOEXCEPT;
+
+/**
  * Set whether to crash the domain if the event listener is no longer present.
  * By default Xen assumes the listener is not required.
  *

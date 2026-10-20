@@ -201,7 +201,7 @@ struct vmi_instance {
 
     uint32_t step_vcpus[MAX_SINGLESTEP_VCPUS]; /**< counter of events on vcpus for which we have internal singlestep enabled */
 
-    gboolean event_callback; /**< flag indicating that libvmi is currently issuing an event callback */
+    gint event_callback; /**< number of event callbacks libvmi is currently issuing (atomic with parallel_events) */
 
     GHashTable *clear_events; /**< table to save vmi_clear_event requests when event_callback is set */
 
@@ -212,7 +212,40 @@ struct vmi_instance {
     void *(*get_data_callback) (vmi_instance_t, addr_t, uint32_t); /**< memory_cache function */
 
     void (*release_data_callback) (vmi_instance_t, void *, size_t); /**< memory_cache function */
+
+    gboolean parallel_events; /**< events of each vCPU are processed on their own worker thread */
+
+    GRWLock events_lock; /**< with parallel_events, protects the event tables and the deferred clear/swap requests */
 };
+
+/*
+ * With parallel events the registered event tables are read by the worker
+ * threads while callbacks may register or clear events. The lock is never held
+ * while a callback runs.
+ */
+static inline void events_write_lock(vmi_instance_t vmi)
+{
+    if (vmi->parallel_events)
+        g_rw_lock_writer_lock(&vmi->events_lock);
+}
+
+static inline void events_write_unlock(vmi_instance_t vmi)
+{
+    if (vmi->parallel_events)
+        g_rw_lock_writer_unlock(&vmi->events_lock);
+}
+
+static inline void events_read_lock(vmi_instance_t vmi)
+{
+    if (vmi->parallel_events)
+        g_rw_lock_reader_lock(&vmi->events_lock);
+}
+
+static inline void events_read_unlock(vmi_instance_t vmi)
+{
+    if (vmi->parallel_events)
+        g_rw_lock_reader_unlock(&vmi->events_lock);
+}
 
 /** Event singlestep reregister wrapper */
 typedef struct step_and_reg_event_wrapper {

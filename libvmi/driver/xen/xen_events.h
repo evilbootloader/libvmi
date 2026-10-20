@@ -68,4 +68,6 @@ void xen_events_destroy(vmi_instance_t vmi);
 
 status_t xen_events_listen(vmi_instance_t vmi, uint32_t timeout);
 
+status_t xen_events_set_parallel(vmi_instance_t vmi, bool enable);
+
 #endif

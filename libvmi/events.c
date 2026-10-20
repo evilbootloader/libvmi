@@ -576,6 +576,22 @@ status_t clear_mem_event(vmi_instance_t vmi, vmi_event_t *event)
 
 }
 
+static status_t shutdown_single_step(vmi_instance_t vmi)
+{
+    if (VMI_SUCCESS == driver_shutdown_single_step(vmi)) {
+        /* Safe to destroy here because the driver has disabled single-step
+         *  for all VCPUs. Library user still manages event allocation at this
+         *  stage.
+         * Recreate hash table for possible future use.
+         */
+        g_hash_table_destroy(vmi->ss_events);
+        vmi->ss_events = g_hash_table_new(g_direct_hash, g_direct_equal);
+        return VMI_SUCCESS;
+    }
+
+    return VMI_FAILURE;
+}
+
 status_t clear_singlestep_event(vmi_instance_t vmi, vmi_event_t *event)
 {
 
@@ -592,7 +608,7 @@ status_t clear_singlestep_event(vmi_instance_t vmi, vmi_event_t *event)
     }
 
     if (0 == g_hash_table_size(vmi->ss_events)) {
-        vmi_shutdown_single_step(vmi);
+        shutdown_single_step(vmi);
     }
 
     return rc;
@@ -683,7 +699,9 @@ status_t swap_events(vmi_instance_t vmi, vmi_event_t *swap_from, vmi_event_t *sw
     if (rc == VMI_FAILURE)
         return rc;
 
+    events_write_lock(vmi);
     g_hash_table_replace(vmi->mem_events_on_gfn, GSIZE_TO_POINTER(swap_to->mem_event.gfn), swap_to);
+    events_write_unlock(vmi);
 
     if ( free_routine )
         free_routine(swap_from, rc);
@@ -813,7 +831,10 @@ vmi_swap_events(
 #endif
 
     if (swap_from->type == swap_to->type && swap_from->type == VMI_EVENT_MEMORY) {
+        events_write_lock(vmi);
+
         if (!g_hash_table_lookup(vmi->mem_events_on_gfn, GSIZE_TO_POINTER(swap_from->mem_event.gfn))) {
+            events_write_unlock(vmi);
             dbprint(VMI_DEBUG_EVENTS, "The event to be swapped is not registered.\n");
             return VMI_FAILURE;
         }
@@ -826,7 +847,9 @@ vmi_swap_events(
          * The user may request a callback when the struct can be safely
          * freed.
          */
-        if ( vmi->event_callback ) {
+        if ( g_atomic_int_get(&vmi->event_callback) ) {
+            status_t rc = VMI_FAILURE;
+
             if (!g_slist_find_custom(vmi->swap_events, &swap_from, swap_search_from)) {
 
                 swap_wrapper_t *wrapper = g_slice_new(swap_wrapper_t);
@@ -838,13 +861,15 @@ vmi_swap_events(
                  * are processed in the order the user issued them. */
                 vmi->swap_events = g_slist_append(vmi->swap_events, wrapper);
 
-                return VMI_SUCCESS;
-            }
+                rc = VMI_SUCCESS;
+            } else
+                dbprint(VMI_DEBUG_EVENTS, "Event was already queued for swapping.\n");
 
-            dbprint(VMI_DEBUG_EVENTS, "Event was already queued for swapping.\n");
-            return VMI_FAILURE;
+            events_write_unlock(vmi);
+            return rc;
         }
 
+        events_write_unlock(vmi);
         return swap_events(vmi, swap_from, swap_to, free_routine);
 
     }
@@ -893,6 +918,8 @@ vmi_register_event(
     }
 #endif
 
+    events_write_lock(vmi);
+
     switch (event->type) {
 
         case VMI_EVENT_REGISTER:
@@ -939,6 +966,8 @@ vmi_register_event(
             break;
     }
 
+    events_write_unlock(vmi);
+
     return rc;
 }
 
@@ -968,19 +997,25 @@ status_t vmi_clear_event(
      * The user may request a callback when the struct can be safely
      * freed.
      */
-    if ( vmi->event_callback ) {
+    events_write_lock(vmi);
+
+    if ( g_atomic_int_get(&vmi->event_callback) ) {
 
         /* If this event was requested to be swapped from calling
          * vmi_clear_event will cause issues for the new event. */
         if (g_slist_find_custom(vmi->swap_events, &event, swap_search_from)) {
+            events_write_unlock(vmi);
             dbprint(VMI_DEBUG_EVENTS, "Event was already queued for swapping.\n");
             return VMI_FAILURE;
         }
 
         if (!g_hash_table_lookup(vmi->clear_events, event)) {
             g_hash_table_insert_compat(vmi->clear_events, event, free_routine);
+            events_write_unlock(vmi);
             return VMI_SUCCESS;
         }
+
+        events_write_unlock(vmi);
 
         /* Event was already requested to be cleared and we haven't
          * got around to actually do it yet. */
@@ -1021,6 +1056,8 @@ status_t vmi_clear_event(
             rc = VMI_FAILURE;
     }
 
+    events_write_unlock(vmi);
+
     if ( free_routine )
         free_routine(event, rc);
 
@@ -1047,6 +1084,15 @@ vmi_step_event(
         goto done;
     }
 #endif
+
+    /*
+     * The stepped event is kept by pointer while parallel callbacks only get
+     * a private copy of the event, and the step list is shared by all vCPUs.
+     */
+    if (vmi->parallel_events) {
+        errprint("%s is not supported with parallel events\n", __FUNCTION__);
+        goto done;
+    }
 
     if (NULL != vmi_get_singlestep_event(vmi, vcpu_id)) {
         if (!vmi->step_vcpus[vcpu_id]) {
@@ -1117,6 +1163,27 @@ status_t vmi_events_listen(vmi_instance_t vmi, uint32_t timeout)
     return driver_events_listen(vmi, timeout);
 }
 
+status_t vmi_events_set_parallel(vmi_instance_t vmi, bool enable)
+{
+#ifdef ENABLE_SAFETY_CHECKS
+    if (!vmi)
+        return VMI_FAILURE;
+
+    if (!(vmi->init_flags & VMI_INIT_EVENTS))
+        return VMI_FAILURE;
+#endif
+
+    if (g_atomic_int_get(&vmi->event_callback)) {
+        errprint("%s can't be called from an event callback\n", __FUNCTION__);
+        return VMI_FAILURE;
+    }
+
+    if (enable && vmi->parallel_events)
+        return VMI_SUCCESS;
+
+    return driver_events_set_parallel(vmi, enable);
+}
+
 status_t vmi_event_listener_required(vmi_instance_t vmi, bool required)
 {
 #ifdef ENABLE_SAFETY_CHECKS
@@ -1154,7 +1221,9 @@ vmi_stop_single_step_vcpu(
 #endif
 
     UNSET_VCPU_SINGLESTEP(event->ss_event, vcpu);
+    events_write_lock(vmi);
     g_hash_table_remove(vmi->ss_events, GUINT_TO_POINTER(vcpu));
+    events_write_unlock(vmi);
 
     return driver_stop_single_step(vmi, vcpu);
 }
@@ -1174,7 +1243,7 @@ vmi_toggle_single_step_vcpu(
     if (!(vmi->init_flags & VMI_INIT_EVENTS))
         return VMI_FAILURE;
 
-    if (vmi->event_callback) {
+    if (g_atomic_int_get(&vmi->event_callback)) {
         errprint("To toggle singlestep while in an event callback, \
                   use VMI_EVENT_RESPONSE_TOGGLE_SINGLESTEP\n");
         return VMI_FAILURE;
@@ -1184,14 +1253,22 @@ vmi_toggle_single_step_vcpu(
     if (enabled) {
         SET_VCPU_SINGLESTEP(event->ss_event, vcpu);
 
-        if (!g_hash_table_insert_compat(vmi->ss_events, GUINT_TO_POINTER(vcpu), event))
+        events_write_lock(vmi);
+        gboolean inserted = g_hash_table_insert_compat(vmi->ss_events, GUINT_TO_POINTER(vcpu), event);
+        events_write_unlock(vmi);
+
+        if (!inserted)
             return VMI_FAILURE;
 
         return driver_start_single_step(vmi, &event->ss_event);
     } else {
         UNSET_VCPU_SINGLESTEP(event->ss_event, vcpu);
 
-        if (!g_hash_table_remove(vmi->ss_events, GUINT_TO_POINTER(vcpu)))
+        events_write_lock(vmi);
+        gboolean removed = g_hash_table_remove(vmi->ss_events, GUINT_TO_POINTER(vcpu));
+        events_write_unlock(vmi);
+
+        if (!removed)
             return VMI_FAILURE;
 
         return driver_stop_single_step(vmi, vcpu);
@@ -1208,18 +1285,11 @@ status_t vmi_shutdown_single_step(vmi_instance_t vmi)
         return VMI_FAILURE;
 #endif
 
-    if (VMI_SUCCESS == driver_shutdown_single_step(vmi)) {
-        /* Safe to destroy here because the driver has disabled single-step
-         *  for all VCPUs. Library user still manages event allocation at this
-         *  stage.
-         * Recreate hash table for possible future use.
-         */
-        g_hash_table_destroy(vmi->ss_events);
-        vmi->ss_events = g_hash_table_new(g_direct_hash, g_direct_equal);
-        return VMI_SUCCESS;
-    }
+    events_write_lock(vmi);
+    status_t rc = shutdown_single_step(vmi);
+    events_write_unlock(vmi);
 
-    return VMI_FAILURE;
+    return rc;
 }
 
 uint32_t vmi_events_version(void)

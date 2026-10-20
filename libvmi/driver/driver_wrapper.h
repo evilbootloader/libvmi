@@ -470,6 +470,19 @@ driver_events_listen(
     return vmi->driver.events_listen_ptr(vmi, timeout);
 }
 
+static inline status_t
+driver_events_set_parallel(
+    vmi_instance_t vmi,
+    bool enable)
+{
+    if (!vmi->driver.initialized || !vmi->driver.events_set_parallel_ptr) {
+        dbprint(VMI_DEBUG_DRIVER, "WARNING: driver_events_set_parallel function not implemented.\n");
+        return VMI_FAILURE;
+    }
+
+    return vmi->driver.events_set_parallel_ptr(vmi, enable);
+}
+
 static inline int
 driver_are_events_pending(
     vmi_instance_t vmi)

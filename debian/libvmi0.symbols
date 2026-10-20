@@ -20,6 +20,7 @@ libvmi-0.15.so libvmi #MINVER#
  vmi_dtb_to_pid@Base 0.15
  vmi_event_listener_required@Base 0.15
  vmi_events_listen@Base 0.15
+ vmi_events_set_parallel@Base 0.15
  vmi_events_version@Base 0.15
  vmi_free_unicode_str@Base 0.15
  vmi_get_access_mode@Base 0.15

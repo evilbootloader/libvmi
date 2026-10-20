@@ -233,6 +233,9 @@ typedef struct driver_interface {
         bool *bootable);
     char* (*get_bios)(
         vmi_instance_t vmi);
+    status_t (*events_set_parallel_ptr)(
+        vmi_instance_t vmi,
+        bool enable);
 
     /* Driver-specific data storage. */
     void* driver_data;

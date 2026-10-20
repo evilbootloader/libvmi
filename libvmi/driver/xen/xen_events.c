@@ -727,6 +727,32 @@ status_t xen_set_domain_watch_event(vmi_instance_t vmi, bool enabled)
  * Event processing functions
  */
 
+static inline void callback_begin(vmi_instance_t vmi)
+{
+    g_atomic_int_inc(&vmi->event_callback);
+}
+
+static inline void callback_end(vmi_instance_t vmi)
+{
+    (void) g_atomic_int_dec_and_test(&vmi->event_callback);
+}
+
+/*
+ * With parallel events each callback gets a private copy of the registered
+ * event, so that the events of other vCPUs processed at the same time don't
+ * overwrite the data in it. Look the registered event up with the events lock
+ * held. It stays valid afterwards because clearing an event is deferred while
+ * callbacks are running.
+ */
+static inline vmi_event_t *event_for_callback(vmi_instance_t vmi, vmi_event_t *registered, vmi_event_t *copy)
+{
+    if ( !registered || !vmi->parallel_events )
+        return registered;
+
+    *copy = *registered;
+    return copy;
+}
+
 /*
  * Here we check for response flags placed on the event in the callback
  * that allows triggering Xen vm_event response flags.
@@ -798,7 +824,11 @@ static
 status_t process_software_breakpoint(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
     xen_instance_t *xen = xen_get_instance(vmi);
-    vmi_event_t *event = g_hash_table_lookup(vmi->interrupt_events, GUINT_TO_POINTER(INT3));
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, g_hash_table_lookup(vmi->interrupt_events, GUINT_TO_POINTER(INT3)), &copy);
+    events_read_unlock(vmi);
 
     if ( !event )
         return VMI_FAILURE;
@@ -814,9 +844,9 @@ status_t process_software_breakpoint(vmi_instance_t vmi, vm_event_compat_t *vmec
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response( event->callback(vmi, event), event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     /* Reinject (callback may decide) */
     if ( !event->interrupt_event.reinject )
@@ -870,7 +900,11 @@ status_t process_software_breakpoint(vmi_instance_t vmi, vm_event_compat_t *vmec
 static
 status_t process_interrupt(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t *event = g_hash_table_lookup(vmi->interrupt_events, GUINT_TO_POINTER(INT_NEXT));
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, g_hash_table_lookup(vmi->interrupt_events, GUINT_TO_POINTER(INT_NEXT)), &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -889,9 +923,9 @@ status_t process_interrupt(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response( event->callback(vmi, event), event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     return VMI_SUCCESS;
 }
@@ -907,7 +941,11 @@ status_t process_register(vmi_instance_t vmi, vm_event_compat_t *vmec)
     };
 
     reg_t lookup = convert[vmec->write_ctrlreg.index];
-    vmi_event_t * event = g_hash_table_lookup(vmi->reg_events, GSIZE_TO_POINTER(lookup));
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, g_hash_table_lookup(vmi->reg_events, GSIZE_TO_POINTER(lookup)), &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -940,9 +978,9 @@ status_t process_register(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event), event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     return VMI_SUCCESS;
 }
@@ -950,10 +988,16 @@ status_t process_register(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_msr(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
     vmi_event_t * event = g_hash_table_lookup(vmi->reg_events, GSIZE_TO_POINTER(MSR_ALL));
 
     if ( !event )
         event = g_hash_table_lookup(vmi->msr_events, GSIZE_TO_POINTER(vmec->mov_to_msr.msr));
+
+    event = event_for_callback(vmi, event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -971,9 +1015,9 @@ status_t process_msr(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event), event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     return VMI_SUCCESS;
 }
@@ -981,7 +1025,11 @@ status_t process_msr(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_singlestep(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = g_hash_table_lookup(vmi->ss_events, GUINT_TO_POINTER(vmec->vcpu_id));
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, g_hash_table_lookup(vmi->ss_events, GUINT_TO_POINTER(vmec->vcpu_id)), &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -999,9 +1047,9 @@ status_t process_singlestep(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event), event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     return VMI_SUCCESS;
 }
@@ -1037,42 +1085,56 @@ status_t process_mem(vmi_instance_t vmi, vm_event_compat_t *vmec)
     if (vmec->mem_access.flags & MEM_ACCESS_W) out_access |= VMI_MEMACCESS_W;
     if (vmec->mem_access.flags & MEM_ACCESS_X) out_access |= VMI_MEMACCESS_X;
 
-    if ( g_hash_table_size(vmi->mem_events_on_gfn) ) {
-        event = g_hash_table_lookup(vmi->mem_events_on_gfn, GSIZE_TO_POINTER(vmec->mem_access.gfn));
+    vmi_event_t copy;
+    GPtrArray *matched = NULL;
 
+    events_read_lock(vmi);
+    event = NULL;
+    if ( g_hash_table_size(vmi->mem_events_on_gfn) )
+        event = event_for_callback(vmi, g_hash_table_lookup(vmi->mem_events_on_gfn, GSIZE_TO_POINTER(vmec->mem_access.gfn)), &copy);
+
+    /* Callbacks may register events, so they are only issued once the lookup is done */
+    if ( (!event || !(event->mem_event.in_access & out_access)) && g_hash_table_size(vmi->mem_events_generic) ) {
+        GHashTableIter i;
+        vmi_mem_access_t *key = NULL;
+        vmi_event_t *generic = NULL;
+
+        matched = g_ptr_array_sized_new(1);
+        ghashtable_foreach(vmi->mem_events_generic, i, &key, &generic) {
+            if ( GPOINTER_TO_UINT(key) & out_access )
+                g_ptr_array_add(matched, generic);
+        }
+    }
+    events_read_unlock(vmi);
+
+    if ( !matched ) {
         if (event && (event->mem_event.in_access & out_access) ) {
             event->x86_regs = &vmec->data.regs.x86;
             event->slat_id = vmec->altp2m_idx;
             event->vcpu_id = vmec->vcpu_id;
             event->page_mode = vmec->pm;
 
-            vmi->event_callback = 1;
+            callback_begin(vmi);
             process_response( issue_mem_cb(vmi, event, vmec, out_access), event, vmec );
-            vmi->event_callback = 0;
+            callback_end(vmi);
 
             return VMI_SUCCESS;
         }
-    }
+    } else {
+        for (guint m = 0; m < matched->len; m++) {
+            event = event_for_callback(vmi, g_ptr_array_index(matched, m), &copy);
+            event->x86_regs = &vmec->data.regs.x86;
+            event->slat_id = vmec->altp2m_idx;
+            event->vcpu_id = vmec->vcpu_id;
+            event->page_mode = vmec->pm;
 
-    if ( g_hash_table_size(vmi->mem_events_generic) ) {
-        GHashTableIter i;
-        vmi_mem_access_t *key = NULL;
-        bool cb_issued = 0;
-
-        ghashtable_foreach(vmi->mem_events_generic, i, &key, &event) {
-            if ( GPOINTER_TO_UINT(key) & out_access ) {
-                event->x86_regs = &vmec->data.regs.x86;
-                event->slat_id = vmec->altp2m_idx;
-                event->vcpu_id = vmec->vcpu_id;
-                event->page_mode = vmec->pm;
-
-                vmi->event_callback = 1;
-                process_response( issue_mem_cb(vmi, event, vmec, out_access), event, vmec );
-                vmi->event_callback = 0;
-
-                cb_issued = 1;
-            }
+            callback_begin(vmi);
+            process_response( issue_mem_cb(vmi, event, vmec, out_access), event, vmec );
+            callback_end(vmi);
         }
+
+        bool cb_issued = matched->len > 0;
+        g_ptr_array_free(matched, TRUE);
 
         if ( cb_issued )
             return VMI_SUCCESS;
@@ -1092,7 +1154,11 @@ status_t process_mem(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_debug_exception(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = vmi->debug_event;
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, vmi->debug_event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -1113,10 +1179,10 @@ status_t process_debug_exception(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event),
                        event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     if ( -1 == event->debug_event.reinject ) {
         errprint("%s Need to specify reinjection behaviour!\n", __FUNCTION__);
@@ -1145,7 +1211,11 @@ status_t process_debug_exception(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_cpuid(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = vmi->cpuid_event;
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, vmi->cpuid_event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -1163,10 +1233,10 @@ status_t process_cpuid(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event),
                        event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     if ( !vmec->flags || vmec->flags == (1 << VM_EVENT_FLAG_VCPU_PAUSED) )
         dbprint(VMI_DEBUG_XEN, "%s warning: CPUID events require the callback to specify how to handle it, we are likely to be going into a CPUID loop right now\n",
@@ -1178,7 +1248,11 @@ status_t process_cpuid(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_vmexit(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = vmi->vmexit_event;
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, vmi->vmexit_event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -1195,10 +1269,10 @@ status_t process_vmexit(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event),
                        event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     return VMI_SUCCESS;
 }
@@ -1206,7 +1280,11 @@ status_t process_vmexit(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_io_instruction(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = vmi->io_event;
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, vmi->io_event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -1225,10 +1303,10 @@ status_t process_io_instruction(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event),
                        event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     if ( !vmec->flags || vmec->flags == (1 << VM_EVENT_FLAG_VCPU_PAUSED) )
         dbprint(VMI_DEBUG_XEN, "%s warning: I/O events require the callback to specify how to handle it\n",
@@ -1240,7 +1318,11 @@ status_t process_io_instruction(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_privcall(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = vmi->privcall_event;
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, vmi->privcall_event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -1264,10 +1346,10 @@ status_t process_privcall(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event),
                        event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     /*
      * SMC instructions are currently not re-injected. In the future, we might encounter a scenario,
@@ -1280,7 +1362,11 @@ status_t process_privcall(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_guest_request(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = vmi->guest_requested_event;
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, vmi->guest_requested_event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -1298,10 +1384,10 @@ status_t process_guest_request(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event),
                        event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     return VMI_SUCCESS;
 }
@@ -1309,7 +1395,11 @@ status_t process_guest_request(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_unimplemented_emul(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = vmi->failed_emulation_event;
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, vmi->failed_emulation_event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -1323,10 +1413,10 @@ status_t process_unimplemented_emul(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event),
                        event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     return VMI_SUCCESS;
 }
@@ -1334,7 +1424,11 @@ status_t process_unimplemented_emul(vmi_instance_t vmi, vm_event_compat_t *vmec)
 static
 status_t process_desc_access(vmi_instance_t vmi, vm_event_compat_t *vmec)
 {
-    vmi_event_t * event = vmi->descriptor_access_event;
+    vmi_event_t copy;
+
+    events_read_lock(vmi);
+    vmi_event_t *event = event_for_callback(vmi, vmi->descriptor_access_event, &copy);
+    events_read_unlock(vmi);
 
 #ifdef ENABLE_SAFETY_CHECKS
     if ( !event ) {
@@ -1353,10 +1447,10 @@ status_t process_desc_access(vmi_instance_t vmi, vm_event_compat_t *vmec)
     event->vcpu_id = vmec->vcpu_id;
     event->page_mode = vmec->pm;
 
-    vmi->event_callback = 1;
+    callback_begin(vmi);
     process_response ( event->callback(vmi, event),
                        event, vmec );
-    vmi->event_callback = 0;
+    callback_end(vmi);
 
     return VMI_SUCCESS;
 }
@@ -3069,6 +3163,487 @@ void ring_get_request_and_response_7(xen_events_t *xe,
     back_ring->rsp_prod_pvt++;
 }
 
+/*
+ * Decoding a request and encoding its response are kept apart from the ring
+ * handling, so the parallel path below can run the callback on another thread
+ * in between.
+ */
+static void decode_request_v7(const vm_event_7_request_t *req,
+                              vm_event_compat_t *vmec)
+{
+    memset(vmec, 0, sizeof(*vmec));
+    vmec->version = req->version;
+    vmec->flags = req->flags;
+    vmec->reason = req->reason;
+    vmec->vcpu_id = req->vcpu_id;
+    vmec->altp2m_idx = req->altp2m_idx;
+
+#if defined(ARM32) || defined(ARM64)
+    memcpy(&vmec->data.regs.arm, &req->data.regs.arm, sizeof(vmec->data.regs.arm));
+#elif defined(I386) || defined(X86_64)
+    vmec->data.regs.x86.rax = req->data.regs.x86.rax;
+    vmec->data.regs.x86.rcx = req->data.regs.x86.rcx;
+    vmec->data.regs.x86.rdx = req->data.regs.x86.rdx;
+    vmec->data.regs.x86.rbx = req->data.regs.x86.rbx;
+    vmec->data.regs.x86.rsp = req->data.regs.x86.rsp;
+    vmec->data.regs.x86.rbp = req->data.regs.x86.rbp;
+    vmec->data.regs.x86.rsi = req->data.regs.x86.rsi;
+    vmec->data.regs.x86.rdi = req->data.regs.x86.rdi;
+    vmec->data.regs.x86.r8 = req->data.regs.x86.r8;
+    vmec->data.regs.x86.r9 = req->data.regs.x86.r9;
+    vmec->data.regs.x86.r10 = req->data.regs.x86.r10;
+    vmec->data.regs.x86.r11 = req->data.regs.x86.r11;
+    vmec->data.regs.x86.r12 = req->data.regs.x86.r12;
+    vmec->data.regs.x86.r13 = req->data.regs.x86.r13;
+    vmec->data.regs.x86.r14 = req->data.regs.x86.r14;
+    vmec->data.regs.x86.r15 = req->data.regs.x86.r15;
+    vmec->data.regs.x86.rflags = req->data.regs.x86.rflags;
+    vmec->data.regs.x86.dr6 = req->data.regs.x86.dr6;
+    vmec->data.regs.x86.dr7 = req->data.regs.x86.dr7;
+    vmec->data.regs.x86.rip = req->data.regs.x86.rip;
+    vmec->data.regs.x86.cr0 = req->data.regs.x86.cr0;
+    vmec->data.regs.x86.cr2 = req->data.regs.x86.cr2;
+    vmec->data.regs.x86.cr3 = req->data.regs.x86.cr3;
+    vmec->data.regs.x86.cr4 = req->data.regs.x86.cr4;
+    vmec->data.regs.x86.sysenter_cs = req->data.regs.x86.sysenter_cs;
+    vmec->data.regs.x86.sysenter_esp = req->data.regs.x86.sysenter_esp;
+    vmec->data.regs.x86.sysenter_eip = req->data.regs.x86.sysenter_eip;
+    vmec->data.regs.x86.msr_efer = req->data.regs.x86.msr_efer;
+    vmec->data.regs.x86.msr_star = req->data.regs.x86.msr_star;
+    vmec->data.regs.x86.msr_lstar = req->data.regs.x86.msr_lstar;
+    vmec->data.regs.x86.gdtr_base = req->data.regs.x86.gdtr_base;
+    vmec->data.regs.x86.gdtr_limit = req->data.regs.x86.gdtr_limit;
+    vmec->data.regs.x86.shadow_gs = req->data.regs.x86.shadow_gs;
+    vmec->data.regs.x86.fs_base = req->data.regs.x86.fs_base;
+    vmec->data.regs.x86.fs_sel = req->data.regs.x86.fs_sel;
+    vmec->data.regs.x86.fs_limit = req->data.regs.x86.fs.limit;
+    vmec->data.regs.x86.fs_arbytes = req->data.regs.x86.fs.ar;
+    vmec->data.regs.x86.gs_base = req->data.regs.x86.gs_base;
+    vmec->data.regs.x86.gs_sel = req->data.regs.x86.gs_sel;
+    vmec->data.regs.x86.gs_limit = req->data.regs.x86.gs.limit;
+    vmec->data.regs.x86.gs_arbytes = req->data.regs.x86.gs.ar;
+    vmec->data.regs.x86.cs_base = req->data.regs.x86.cs_base;
+    vmec->data.regs.x86.cs_sel = req->data.regs.x86.cs_sel;
+    vmec->data.regs.x86.cs_limit = req->data.regs.x86.cs.limit;
+    vmec->data.regs.x86.cs_arbytes = req->data.regs.x86.cs.ar;
+    vmec->data.regs.x86.ds_base = req->data.regs.x86.ds_base;
+    vmec->data.regs.x86.ds_sel = req->data.regs.x86.ds_sel;
+    vmec->data.regs.x86.ds_limit = req->data.regs.x86.ds.limit;
+    vmec->data.regs.x86.ds_arbytes = req->data.regs.x86.ds.ar;
+    vmec->data.regs.x86.es_base = req->data.regs.x86.es_base;
+    vmec->data.regs.x86.es_sel = req->data.regs.x86.es_sel;
+    vmec->data.regs.x86.es_limit = req->data.regs.x86.es.limit;
+    vmec->data.regs.x86.es_arbytes = req->data.regs.x86.es.ar;
+    vmec->data.regs.x86.ss_base = req->data.regs.x86.ss_base;
+    vmec->data.regs.x86.ss_sel = req->data.regs.x86.ss_sel;
+    vmec->data.regs.x86.ss_limit = req->data.regs.x86.ss.limit;
+    vmec->data.regs.x86.ss_arbytes = req->data.regs.x86.ss.ar;
+    vmec->data.regs.x86.vmtrace_pos = req->data.regs.x86.vmtrace_pos;
+
+    if ( !(vmec->flags & VM_EVENT_FLAG_NESTED_P2M) )
+        vmec->data.regs.x86.npt_base = 0;
+    else
+        vmec->data.regs.x86.npt_base = req->data.regs.x86.npt_base;
+#endif
+
+    switch ( vmec->reason ) {
+        case VM_EVENT_REASON_MEM_ACCESS:
+            memcpy(&vmec->mem_access, &req->u.mem_access, sizeof(vmec->mem_access));
+            break;
+
+        case VM_EVENT_REASON_WRITE_CTRLREG:
+            memcpy(&vmec->write_ctrlreg, &req->u.write_ctrlreg, sizeof(vmec->write_ctrlreg));
+            break;
+
+        case VM_EVENT_REASON_MOV_TO_MSR:
+            memcpy(&vmec->mov_to_msr, &req->u.mov_to_msr, sizeof(vmec->mov_to_msr));
+            break;
+
+        case VM_EVENT_REASON_SINGLESTEP:
+            memcpy(&vmec->singlestep, &req->u.singlestep, sizeof(vmec->singlestep));
+            break;
+
+        case VM_EVENT_REASON_SOFTWARE_BREAKPOINT:
+            vmec->software_breakpoint.gfn = req->u.software_breakpoint.gfn;
+            vmec->software_breakpoint.insn_length = req->u.software_breakpoint.insn_length;
+            break;
+
+        case VM_EVENT_REASON_INTERRUPT:
+            memcpy(&vmec->x86_interrupt, &req->u.interrupt.x86, sizeof(vmec->x86_interrupt));
+            break;
+
+        case VM_EVENT_REASON_DEBUG_EXCEPTION:
+            vmec->debug_exception.gfn = req->u.debug_exception.gfn;
+            vmec->debug_exception.insn_length = req->u.debug_exception.insn_length;
+            vmec->debug_exception.type = req->u.debug_exception.type;
+            break;
+
+        case VM_EVENT_REASON_CPUID:
+            memcpy(&vmec->cpuid, &req->u.cpuid, sizeof(vmec->cpuid));
+            break;
+
+        case VM_EVENT_REASON_DESCRIPTOR_ACCESS:
+            memcpy(&vmec->desc_access, &req->u.desc_access, sizeof(vmec->desc_access));
+            break;
+
+        case VM_EVENT_REASON_VMEXIT:
+            memcpy(&vmec->vmexit, &req->u.vmexit, sizeof(vmec->vmexit));
+            break;
+
+        case VM_EVENT_REASON_IO_INSTRUCTION:
+            memcpy(&vmec->io_instruction, &req->u.io_instruction, sizeof(vmec->io_instruction));
+            break;
+    }
+}
+
+static void encode_response_v7(const vm_event_compat_t *vmec,
+                               vm_event_7_response_t *rsp)
+{
+    rsp->version = vmec->version;
+    rsp->vcpu_id = vmec->vcpu_id;
+    rsp->flags = vmec->flags;
+    rsp->reason = vmec->reason;
+    rsp->altp2m_idx = vmec->altp2m_idx;
+
+    if ( rsp->flags & VM_EVENT_FLAG_SET_EMUL_READ_DATA ) {
+        rsp->data.emul.read.size = vmec->data.emul.read.size;
+        memcpy(&rsp->data.emul.read.data, &vmec->data.emul.read.data, vmec->data.emul.read.size);
+    }
+
+    if ( rsp->flags & VM_EVENT_FLAG_SET_EMUL_INSN_DATA )
+        memcpy(&rsp->data.emul.insn, &vmec->data.emul.insn, sizeof(rsp->data.emul.insn));
+
+    if ( rsp->flags & VM_EVENT_FLAG_FAST_SINGLESTEP )
+        rsp->u.fast_singlestep.p2midx = vmec->fast_singlestep.p2midx;
+
+    if ( rsp->flags & VM_EVENT_FLAG_SET_REGISTERS ) {
+#if defined(ARM32) || defined(ARM64)
+        memcpy(&rsp->data.regs.arm, &vmec->data.regs.arm, sizeof(rsp->data.regs.arm));
+#elif defined(I386) || defined(X86_64)
+        rsp->data.regs.x86.rax = vmec->data.regs.x86.rax;
+        rsp->data.regs.x86.rcx = vmec->data.regs.x86.rcx;
+        rsp->data.regs.x86.rdx = vmec->data.regs.x86.rdx;
+        rsp->data.regs.x86.rbx = vmec->data.regs.x86.rbx;
+        rsp->data.regs.x86.rsp = vmec->data.regs.x86.rsp;
+        rsp->data.regs.x86.rbp = vmec->data.regs.x86.rbp;
+        rsp->data.regs.x86.rsi = vmec->data.regs.x86.rsi;
+        rsp->data.regs.x86.rdi = vmec->data.regs.x86.rdi;
+        rsp->data.regs.x86.r8 = vmec->data.regs.x86.r8;
+        rsp->data.regs.x86.r9 = vmec->data.regs.x86.r9;
+        rsp->data.regs.x86.r10 = vmec->data.regs.x86.r10;
+        rsp->data.regs.x86.r11 = vmec->data.regs.x86.r11;
+        rsp->data.regs.x86.r12 = vmec->data.regs.x86.r12;
+        rsp->data.regs.x86.r13 = vmec->data.regs.x86.r13;
+        rsp->data.regs.x86.r14 = vmec->data.regs.x86.r14;
+        rsp->data.regs.x86.r15 = vmec->data.regs.x86.r15;
+        rsp->data.regs.x86.rflags = vmec->data.regs.x86.rflags;
+        rsp->data.regs.x86.dr6 = vmec->data.regs.x86.dr6;
+        rsp->data.regs.x86.dr7 = vmec->data.regs.x86.dr7;
+        rsp->data.regs.x86.rip = vmec->data.regs.x86.rip;
+        rsp->data.regs.x86.cr0 = vmec->data.regs.x86.cr0;
+        rsp->data.regs.x86.cr2 = vmec->data.regs.x86.cr2;
+        rsp->data.regs.x86.cr3 = vmec->data.regs.x86.cr3;
+        rsp->data.regs.x86.cr4 = vmec->data.regs.x86.cr4;
+        rsp->data.regs.x86.sysenter_cs = vmec->data.regs.x86.sysenter_cs;
+        rsp->data.regs.x86.sysenter_esp = vmec->data.regs.x86.sysenter_esp;
+        rsp->data.regs.x86.sysenter_eip = vmec->data.regs.x86.sysenter_eip;
+        rsp->data.regs.x86.msr_efer = vmec->data.regs.x86.msr_efer;
+        rsp->data.regs.x86.msr_star = vmec->data.regs.x86.msr_star;
+        rsp->data.regs.x86.msr_lstar = vmec->data.regs.x86.msr_lstar;
+        rsp->data.regs.x86.gdtr_base = vmec->data.regs.x86.gdtr_base;
+        rsp->data.regs.x86.gdtr_limit = vmec->data.regs.x86.gdtr_limit;
+        rsp->data.regs.x86.shadow_gs = vmec->data.regs.x86.shadow_gs;
+        rsp->data.regs.x86.fs_base = vmec->data.regs.x86.fs_base;
+        rsp->data.regs.x86.fs_sel = vmec->data.regs.x86.fs_sel;
+        rsp->data.regs.x86.fs.ar = vmec->data.regs.x86.fs_arbytes;
+        rsp->data.regs.x86.fs.limit = vmec->data.regs.x86.fs_limit;
+        rsp->data.regs.x86.gs_base = vmec->data.regs.x86.gs_base;
+        rsp->data.regs.x86.gs_sel = vmec->data.regs.x86.gs_sel;
+        rsp->data.regs.x86.gs.ar = vmec->data.regs.x86.gs_arbytes;
+        rsp->data.regs.x86.gs.limit = vmec->data.regs.x86.gs_limit;
+        rsp->data.regs.x86.cs_base = vmec->data.regs.x86.cs_base;
+        rsp->data.regs.x86.cs_sel = vmec->data.regs.x86.cs_sel;
+        rsp->data.regs.x86.cs.ar = vmec->data.regs.x86.cs_arbytes;
+        rsp->data.regs.x86.cs.limit = vmec->data.regs.x86.cs_limit;
+        rsp->data.regs.x86.ds_base = vmec->data.regs.x86.ds_base;
+        rsp->data.regs.x86.ds_sel = vmec->data.regs.x86.ds_sel;
+        rsp->data.regs.x86.ds.ar = vmec->data.regs.x86.ds_arbytes;
+        rsp->data.regs.x86.ds.limit = vmec->data.regs.x86.ds_limit;
+        rsp->data.regs.x86.es_base = vmec->data.regs.x86.es_base;
+        rsp->data.regs.x86.es_sel = vmec->data.regs.x86.es_sel;
+        rsp->data.regs.x86.es.ar = vmec->data.regs.x86.es_arbytes;
+        rsp->data.regs.x86.es.limit = vmec->data.regs.x86.es_limit;
+        rsp->data.regs.x86.ss_base = vmec->data.regs.x86.ss_base;
+        rsp->data.regs.x86.ss_sel = vmec->data.regs.x86.ss_sel;
+        rsp->data.regs.x86.ss.ar = vmec->data.regs.x86.ss_arbytes;
+        rsp->data.regs.x86.ss.limit = vmec->data.regs.x86.ss_limit;
+        rsp->data.regs.x86._pad = 0;
+#endif
+    }
+}
+
+/*
+ * Parallel v7 event processing.
+ *
+ * The listener thread takes the requests off the ring and hands a copy of
+ * each to the worker thread of the request's vCPU, so the events of one vCPU
+ * are processed in order while different vCPUs are processed concurrently.
+ * Each worker places its response on the ring as soon as the callback
+ * returned and notifies Xen. Xen matches responses to vCPUs by vcpu_id, so
+ * their order on the ring doesn't matter, and every response slot is behind
+ * req_cons because a request is copied before it is consumed.
+ *
+ * process_requests_7_parallel() returns only once every request it took has
+ * been answered. No callback runs at that point, which is when deferred
+ * vmi_clear_event and vmi_swap_events requests are applied and when the
+ * library user may change the state its callbacks share. To reach that point
+ * regularly under load the listener stops taking new requests after a budget.
+ *
+ * vmi_events_set_parallel() starts the workers. LIBVMI_VCPU_BATCH=1 starts
+ * them at init but keeps the callbacks serialized, for debugging.
+ */
+#define PARALLEL_REQUESTS_PER_VCPU 32       /* requests taken per vCPU before draining */
+#define PARALLEL_LISTEN_BUDGET_US  10000    /* time spent taking requests before draining */
+#define PARALLEL_POLL_US           100      /* how long to wait for a worker before checking the ring */
+
+typedef struct xen_vcpu_batch xen_vcpu_batch_t;
+
+status_t process_requests_7(vmi_instance_t vmi, uint32_t *requests_processed);
+
+typedef struct xen_vcpu_job {
+    vm_event_compat_t vmec;
+    status_t result;
+    gboolean shutdown;
+} xen_vcpu_job_t;
+
+typedef struct xen_vcpu_worker {
+    GThread *thread;
+    GAsyncQueue *queue;
+    xen_vcpu_batch_t *batch;
+} xen_vcpu_worker_t;
+
+struct xen_vcpu_batch {
+    vmi_instance_t vmi;
+    uint32_t n_vcpus;
+    xen_vcpu_worker_t *workers;
+    GAsyncQueue *done_queue;        /* answered jobs, freed by the listener */
+    GMutex ring_lock;               /* producing responses and checking the ring */
+    GMutex callback_lock;           /* serializes the callbacks if serialize_callbacks */
+    gboolean serialize_callbacks;
+};
+
+static void reply_7(xen_vcpu_batch_t *batch, xen_vcpu_job_t *job)
+{
+    vmi_instance_t vmi = batch->vmi;
+    xen_events_t *xe = xen_get_events(vmi);
+    xen_instance_t *xen = xen_get_instance(vmi);
+    vm_event_7_back_ring_t *ring = &xe->back_ring_7;
+
+    g_mutex_lock(&batch->ring_lock);
+    encode_response_v7(&job->vmec, RING_GET_RESPONSE(ring, ring->rsp_prod_pvt));
+    ring->rsp_prod_pvt++;
+    RING_PUSH_RESPONSES(ring);
+    g_mutex_unlock(&batch->ring_lock);
+
+    /* The vCPU stays paused until Xen is notified */
+    if ( xen->libxcw.xc_evtchn_notify(xe->xce_handle, xe->port) ) {
+        errprint("Error sending event channel notification.\n");
+        job->result = VMI_FAILURE;
+    }
+}
+
+static gpointer xen_vcpu_worker_main(gpointer opaque)
+{
+    xen_vcpu_worker_t *worker = opaque;
+    xen_vcpu_batch_t *batch = worker->batch;
+    vmi_instance_t vmi = batch->vmi;
+
+    for (;;) {
+        xen_vcpu_job_t *job = g_async_queue_pop(worker->queue);
+        if (job->shutdown) {
+            g_free(job);
+            return NULL;
+        }
+
+        if (batch->serialize_callbacks)
+            g_mutex_lock(&batch->callback_lock);
+
+        /*
+         * The whole request counts as being in a callback, so clearing an
+         * event is deferred while any worker may still be looking it up.
+         */
+        callback_begin(vmi);
+        job->result = process_request(vmi, &job->vmec);
+        callback_end(vmi);
+
+        if (batch->serialize_callbacks)
+            g_mutex_unlock(&batch->callback_lock);
+
+        reply_7(batch, job);
+        g_async_queue_push(batch->done_queue, job);
+    }
+}
+
+static void xen_vcpu_batch_shutdown(xen_vcpu_batch_t *batch)
+{
+    if (!batch)
+        return;
+
+    for (uint32_t i = 0; i < batch->n_vcpus; ++i) {
+        xen_vcpu_worker_t *worker = &batch->workers[i];
+        if (worker->thread) {
+            xen_vcpu_job_t *stop = g_new0(xen_vcpu_job_t, 1);
+            stop->shutdown = TRUE;
+            g_async_queue_push(worker->queue, stop);
+        }
+    }
+    for (uint32_t i = 0; i < batch->n_vcpus; ++i) {
+        xen_vcpu_worker_t *worker = &batch->workers[i];
+        if (worker->thread)
+            g_thread_join(worker->thread);
+        if (worker->queue)
+            g_async_queue_unref(worker->queue);
+    }
+    g_async_queue_unref(batch->done_queue);
+    g_mutex_clear(&batch->ring_lock);
+    g_mutex_clear(&batch->callback_lock);
+    g_free(batch->workers);
+    g_free(batch);
+}
+
+static xen_vcpu_batch_t *xen_vcpu_batch_create(vmi_instance_t vmi, gboolean serialize_callbacks)
+{
+    uint32_t n = vmi->num_vcpus;
+    if (!n)
+        return NULL;
+
+    xen_vcpu_batch_t *batch = g_new0(xen_vcpu_batch_t, 1);
+    batch->workers = g_new0(xen_vcpu_worker_t, n);
+    batch->n_vcpus = n;
+    batch->vmi = vmi;
+    batch->serialize_callbacks = serialize_callbacks;
+    batch->done_queue = g_async_queue_new();
+    g_mutex_init(&batch->ring_lock);
+    g_mutex_init(&batch->callback_lock);
+
+    for (uint32_t i = 0; i < n; ++i) {
+        xen_vcpu_worker_t *worker = &batch->workers[i];
+        worker->batch = batch;
+        worker->queue = g_async_queue_new();
+        GError *error = NULL;
+        gchar *name = g_strdup_printf("vmi-vcpu%u", i);
+        worker->thread = g_thread_try_new(name, xen_vcpu_worker_main,
+                                          worker, &error);
+        g_free(name);
+        if (!worker->thread) {
+            errprint("Couldn't start vCPU worker %u: %s\n", i,
+                     error ? error->message : "unknown error");
+            g_clear_error(&error);
+            xen_vcpu_batch_shutdown(batch);
+            return NULL;
+        }
+    }
+    return batch;
+}
+
+static status_t process_requests_7_parallel(vmi_instance_t vmi, uint32_t *requests_processed)
+{
+    xen_events_t *xe = xen_get_events(vmi);
+    vm_event_7_back_ring_t *ring = &xe->back_ring_7;
+    xen_vcpu_batch_t *batch = xe->vcpu_batch;
+    const uint32_t budget = batch->n_vcpus * PARALLEL_REQUESTS_PER_VCPU;
+    const gint64 deadline = g_get_monotonic_time() + PARALLEL_LISTEN_BUDGET_US;
+    uint32_t taken = 0, inflight = 0;
+    gboolean accept = TRUE;
+    status_t result = VMI_SUCCESS;
+
+    for (;;) {
+        while (accept && taken < budget) {
+            /* Workers move rsp_prod_pvt, which bounds the unconsumed requests */
+            g_mutex_lock(&batch->ring_lock);
+            int pending = RING_HAS_UNCONSUMED_REQUESTS(ring);
+            g_mutex_unlock(&batch->ring_lock);
+
+            if (!pending)
+                break;
+
+            vm_event_7_request_t *req = RING_GET_REQUEST(ring, ring->req_cons);
+            if (req->version != 0x00000007 || req->vcpu_id >= batch->n_vcpus) {
+                errprint("Invalid v7 event version/vCPU (0x%x/%u)\n",
+                         req->version, req->vcpu_id);
+                result = VMI_FAILURE;
+                accept = FALSE;
+                break;
+            }
+
+            xen_vcpu_job_t *job = g_new0(xen_vcpu_job_t, 1);
+            decode_request_v7(req, &job->vmec);
+
+            /* Only the request is consumed here, the worker produces the response */
+            ++ring->req_cons;
+            ring->sring->req_event = ring->req_cons + 1;
+            ++taken;
+            ++inflight;
+            g_async_queue_push(batch->workers[job->vmec.vcpu_id].queue, job);
+        }
+
+        if (!inflight)
+            break;
+
+        xen_vcpu_job_t *job = g_async_queue_timeout_pop(batch->done_queue, PARALLEL_POLL_US);
+        while (job) {
+            if (VMI_FAILURE == job->result) {
+                result = VMI_FAILURE;
+#ifdef ENABLE_SAFETY_CHECKS
+                accept = FALSE;
+#endif
+            }
+            g_free(job);
+            --inflight;
+            job = g_async_queue_try_pop(batch->done_queue);
+        }
+
+        if (g_get_monotonic_time() >= deadline)
+            accept = FALSE;
+    }
+
+    *requests_processed = taken;
+    return result;
+}
+
+status_t xen_events_set_parallel(vmi_instance_t vmi, bool enable)
+{
+    xen_events_t *xe = xen_get_events(vmi);
+
+    if ( !xe )
+        return VMI_FAILURE;
+
+    /* Also stops workers started with LIBVMI_VCPU_BATCH */
+    if ( !enable ) {
+        xen_vcpu_batch_shutdown(xe->vcpu_batch);
+        xe->vcpu_batch = NULL;
+        vmi->parallel_events = FALSE;
+        return VMI_SUCCESS;
+    }
+
+    if ( xe->process_requests != &process_requests_7 ) {
+        errprint("Parallel events require the vm_event interface version 7\n");
+        return VMI_FAILURE;
+    }
+
+    if ( !xe->vcpu_batch ) {
+        xe->vcpu_batch = xen_vcpu_batch_create(vmi, FALSE);
+        if ( !xe->vcpu_batch )
+            return VMI_FAILURE;
+    }
+
+    xe->vcpu_batch->serialize_callbacks = FALSE;
+    vmi->parallel_events = TRUE;
+
+    dbprint(VMI_DEBUG_XEN, "Processing the events of %u vCPUs in parallel\n", xe->vcpu_batch->n_vcpus);
+    return VMI_SUCCESS;
+}
+
 status_t process_requests_7(vmi_instance_t vmi, uint32_t *requests_processed)
 {
     vm_event_7_request_t *req;
@@ -3080,6 +3655,9 @@ status_t process_requests_7(vmi_instance_t vmi, uint32_t *requests_processed)
     status_t vrc = VMI_SUCCESS;
     uint32_t processed = 0;
 
+    if (xe->vcpu_batch)
+        return process_requests_7_parallel(vmi, requests_processed);
+
     while ( RING_HAS_UNCONSUMED_REQUESTS(&xe->back_ring_7) ) {
 
         ring_get_request_and_response_7(xe, &req, &rsp);
@@ -3090,217 +3668,14 @@ status_t process_requests_7(vmi_instance_t vmi, uint32_t *requests_processed)
             return VMI_FAILURE;
         }
 
-        vmec.version = req->version;
-        vmec.flags = req->flags;
-        vmec.reason = req->reason;
-        vmec.vcpu_id = req->vcpu_id;
-        vmec.altp2m_idx = req->altp2m_idx;
-
-#if defined(ARM32) || defined(ARM64)
-        memcpy(&vmec.data.regs.arm, &req->data.regs.arm, sizeof(vmec.data.regs.arm));
-#elif defined(I386) || defined(X86_64)
-        vmec.data.regs.x86.rax = req->data.regs.x86.rax;
-        vmec.data.regs.x86.rcx = req->data.regs.x86.rcx;
-        vmec.data.regs.x86.rdx = req->data.regs.x86.rdx;
-        vmec.data.regs.x86.rbx = req->data.regs.x86.rbx;
-        vmec.data.regs.x86.rsp = req->data.regs.x86.rsp;
-        vmec.data.regs.x86.rbp = req->data.regs.x86.rbp;
-        vmec.data.regs.x86.rsi = req->data.regs.x86.rsi;
-        vmec.data.regs.x86.rdi = req->data.regs.x86.rdi;
-        vmec.data.regs.x86.r8 = req->data.regs.x86.r8;
-        vmec.data.regs.x86.r9 = req->data.regs.x86.r9;
-        vmec.data.regs.x86.r10 = req->data.regs.x86.r10;
-        vmec.data.regs.x86.r11 = req->data.regs.x86.r11;
-        vmec.data.regs.x86.r12 = req->data.regs.x86.r12;
-        vmec.data.regs.x86.r13 = req->data.regs.x86.r13;
-        vmec.data.regs.x86.r14 = req->data.regs.x86.r14;
-        vmec.data.regs.x86.r15 = req->data.regs.x86.r15;
-        vmec.data.regs.x86.rflags = req->data.regs.x86.rflags;
-        vmec.data.regs.x86.dr6 = req->data.regs.x86.dr6;
-        vmec.data.regs.x86.dr7 = req->data.regs.x86.dr7;
-        vmec.data.regs.x86.rip = req->data.regs.x86.rip;
-        vmec.data.regs.x86.cr0 = req->data.regs.x86.cr0;
-        vmec.data.regs.x86.cr2 = req->data.regs.x86.cr2;
-        vmec.data.regs.x86.cr3 = req->data.regs.x86.cr3;
-        vmec.data.regs.x86.cr4 = req->data.regs.x86.cr4;
-        vmec.data.regs.x86.sysenter_cs = req->data.regs.x86.sysenter_cs;
-        vmec.data.regs.x86.sysenter_esp = req->data.regs.x86.sysenter_esp;
-        vmec.data.regs.x86.sysenter_eip = req->data.regs.x86.sysenter_eip;
-        vmec.data.regs.x86.msr_efer = req->data.regs.x86.msr_efer;
-        vmec.data.regs.x86.msr_star = req->data.regs.x86.msr_star;
-        vmec.data.regs.x86.msr_lstar = req->data.regs.x86.msr_lstar;
-        vmec.data.regs.x86.gdtr_base = req->data.regs.x86.gdtr_base;
-        vmec.data.regs.x86.gdtr_limit = req->data.regs.x86.gdtr_limit;
-        vmec.data.regs.x86.shadow_gs = req->data.regs.x86.shadow_gs;
-        vmec.data.regs.x86.fs_base = req->data.regs.x86.fs_base;
-        vmec.data.regs.x86.fs_sel = req->data.regs.x86.fs_sel;
-        vmec.data.regs.x86.fs_limit = req->data.regs.x86.fs.limit;
-        vmec.data.regs.x86.fs_arbytes = req->data.regs.x86.fs.ar;
-        vmec.data.regs.x86.gs_base = req->data.regs.x86.gs_base;
-        vmec.data.regs.x86.gs_sel = req->data.regs.x86.gs_sel;
-        vmec.data.regs.x86.gs_limit = req->data.regs.x86.gs.limit;
-        vmec.data.regs.x86.gs_arbytes = req->data.regs.x86.gs.ar;
-        vmec.data.regs.x86.cs_base = req->data.regs.x86.cs_base;
-        vmec.data.regs.x86.cs_sel = req->data.regs.x86.cs_sel;
-        vmec.data.regs.x86.cs_limit = req->data.regs.x86.cs.limit;
-        vmec.data.regs.x86.cs_arbytes = req->data.regs.x86.cs.ar;
-        vmec.data.regs.x86.ds_base = req->data.regs.x86.ds_base;
-        vmec.data.regs.x86.ds_sel = req->data.regs.x86.ds_sel;
-        vmec.data.regs.x86.ds_limit = req->data.regs.x86.ds.limit;
-        vmec.data.regs.x86.ds_arbytes = req->data.regs.x86.ds.ar;
-        vmec.data.regs.x86.es_base = req->data.regs.x86.es_base;
-        vmec.data.regs.x86.es_sel = req->data.regs.x86.es_sel;
-        vmec.data.regs.x86.es_limit = req->data.regs.x86.es.limit;
-        vmec.data.regs.x86.es_arbytes = req->data.regs.x86.es.ar;
-        vmec.data.regs.x86.ss_base = req->data.regs.x86.ss_base;
-        vmec.data.regs.x86.ss_sel = req->data.regs.x86.ss_sel;
-        vmec.data.regs.x86.ss_limit = req->data.regs.x86.ss.limit;
-        vmec.data.regs.x86.ss_arbytes = req->data.regs.x86.ss.ar;
-        vmec.data.regs.x86.vmtrace_pos = req->data.regs.x86.vmtrace_pos;
-
-        if ( !(vmec.flags & VM_EVENT_FLAG_NESTED_P2M) )
-            vmec.data.regs.x86.npt_base = 0;
-        else
-            vmec.data.regs.x86.npt_base = req->data.regs.x86.npt_base;
-#endif
-
-        switch ( vmec.reason ) {
-            case VM_EVENT_REASON_MEM_ACCESS:
-                memcpy(&vmec.mem_access, &req->u.mem_access, sizeof(vmec.mem_access));
-                break;
-
-            case VM_EVENT_REASON_WRITE_CTRLREG:
-                memcpy(&vmec.write_ctrlreg, &req->u.write_ctrlreg, sizeof(vmec.write_ctrlreg));
-                break;
-
-            case VM_EVENT_REASON_MOV_TO_MSR:
-                memcpy(&vmec.mov_to_msr, &req->u.mov_to_msr, sizeof(vmec.mov_to_msr));
-                break;
-
-            case VM_EVENT_REASON_SINGLESTEP:
-                memcpy(&vmec.singlestep, &req->u.singlestep, sizeof(vmec.singlestep));
-                break;
-
-            case VM_EVENT_REASON_SOFTWARE_BREAKPOINT:
-                vmec.software_breakpoint.gfn = req->u.software_breakpoint.gfn;
-                vmec.software_breakpoint.insn_length = req->u.software_breakpoint.insn_length;
-                break;
-
-            case VM_EVENT_REASON_INTERRUPT:
-                memcpy(&vmec.x86_interrupt, &req->u.interrupt.x86, sizeof(vmec.x86_interrupt));
-                break;
-
-            case VM_EVENT_REASON_DEBUG_EXCEPTION:
-                vmec.debug_exception.gfn = req->u.debug_exception.gfn;
-                vmec.debug_exception.insn_length = req->u.debug_exception.insn_length;
-                vmec.debug_exception.type = req->u.debug_exception.type;
-                break;
-
-            case VM_EVENT_REASON_CPUID:
-                memcpy(&vmec.cpuid, &req->u.cpuid, sizeof(vmec.cpuid));
-                break;
-
-            case VM_EVENT_REASON_DESCRIPTOR_ACCESS:
-                memcpy(&vmec.desc_access, &req->u.desc_access, sizeof(vmec.desc_access));
-                break;
-
-            case VM_EVENT_REASON_VMEXIT:
-                memcpy(&vmec.vmexit, &req->u.vmexit, sizeof(vmec.vmexit));
-                break;
-
-            case VM_EVENT_REASON_IO_INSTRUCTION:
-                memcpy(&vmec.io_instruction, &req->u.io_instruction, sizeof(vmec.io_instruction));
-                break;
-        }
-
+        decode_request_v7(req, &vmec);
         vrc = process_request(vmi, &vmec);
 #ifdef ENABLE_SAFETY_CHECKS
         if ( VMI_FAILURE == vrc )
             break;
 #endif
 
-        rsp->version = vmec.version;
-        rsp->vcpu_id = vmec.vcpu_id;
-        rsp->flags = vmec.flags;
-        rsp->reason = vmec.reason;
-        rsp->altp2m_idx = vmec.altp2m_idx;
-
-        if ( rsp->flags & VM_EVENT_FLAG_SET_EMUL_READ_DATA ) {
-            rsp->data.emul.read.size = vmec.data.emul.read.size;
-            memcpy(&rsp->data.emul.read.data, &vmec.data.emul.read.data, vmec.data.emul.read.size);
-        }
-
-        if ( rsp->flags & VM_EVENT_FLAG_SET_EMUL_INSN_DATA )
-            memcpy(&rsp->data.emul.insn, &vmec.data.emul.insn, sizeof(rsp->data.emul.insn));
-
-        if ( rsp->flags & VM_EVENT_FLAG_FAST_SINGLESTEP )
-            rsp->u.fast_singlestep.p2midx = vmec.fast_singlestep.p2midx;
-
-        if ( rsp->flags & VM_EVENT_FLAG_SET_REGISTERS ) {
-#if defined(ARM32) || defined(ARM64)
-            memcpy(&rsp->data.regs.arm, &vmec.data.regs.arm, sizeof(rsp->data.regs.arm));
-#elif defined(I386) || defined(X86_64)
-            rsp->data.regs.x86.rax = vmec.data.regs.x86.rax;
-            rsp->data.regs.x86.rcx = vmec.data.regs.x86.rcx;
-            rsp->data.regs.x86.rdx = vmec.data.regs.x86.rdx;
-            rsp->data.regs.x86.rbx = vmec.data.regs.x86.rbx;
-            rsp->data.regs.x86.rsp = vmec.data.regs.x86.rsp;
-            rsp->data.regs.x86.rbp = vmec.data.regs.x86.rbp;
-            rsp->data.regs.x86.rsi = vmec.data.regs.x86.rsi;
-            rsp->data.regs.x86.rdi = vmec.data.regs.x86.rdi;
-            rsp->data.regs.x86.r8 = vmec.data.regs.x86.r8;
-            rsp->data.regs.x86.r9 = vmec.data.regs.x86.r9;
-            rsp->data.regs.x86.r10 = vmec.data.regs.x86.r10;
-            rsp->data.regs.x86.r11 = vmec.data.regs.x86.r11;
-            rsp->data.regs.x86.r12 = vmec.data.regs.x86.r12;
-            rsp->data.regs.x86.r13 = vmec.data.regs.x86.r13;
-            rsp->data.regs.x86.r14 = vmec.data.regs.x86.r14;
-            rsp->data.regs.x86.r15 = vmec.data.regs.x86.r15;
-            rsp->data.regs.x86.rflags = vmec.data.regs.x86.rflags;
-            rsp->data.regs.x86.dr6 = vmec.data.regs.x86.dr6;
-            rsp->data.regs.x86.dr7 = vmec.data.regs.x86.dr7;
-            rsp->data.regs.x86.rip = vmec.data.regs.x86.rip;
-            rsp->data.regs.x86.cr0 = vmec.data.regs.x86.cr0;
-            rsp->data.regs.x86.cr2 = vmec.data.regs.x86.cr2;
-            rsp->data.regs.x86.cr3 = vmec.data.regs.x86.cr3;
-            rsp->data.regs.x86.cr4 = vmec.data.regs.x86.cr4;
-            rsp->data.regs.x86.sysenter_cs = vmec.data.regs.x86.sysenter_cs;
-            rsp->data.regs.x86.sysenter_esp = vmec.data.regs.x86.sysenter_esp;
-            rsp->data.regs.x86.sysenter_eip = vmec.data.regs.x86.sysenter_eip;
-            rsp->data.regs.x86.msr_efer = vmec.data.regs.x86.msr_efer;
-            rsp->data.regs.x86.msr_star = vmec.data.regs.x86.msr_star;
-            rsp->data.regs.x86.msr_lstar = vmec.data.regs.x86.msr_lstar;
-            rsp->data.regs.x86.gdtr_base = vmec.data.regs.x86.gdtr_base;
-            rsp->data.regs.x86.gdtr_limit = vmec.data.regs.x86.gdtr_limit;
-            rsp->data.regs.x86.shadow_gs = vmec.data.regs.x86.shadow_gs;
-            rsp->data.regs.x86.fs_base = vmec.data.regs.x86.fs_base;
-            rsp->data.regs.x86.fs_sel = vmec.data.regs.x86.fs_sel;
-            rsp->data.regs.x86.fs.ar = vmec.data.regs.x86.fs_arbytes;
-            rsp->data.regs.x86.fs.limit = vmec.data.regs.x86.fs_limit;
-            rsp->data.regs.x86.gs_base = vmec.data.regs.x86.gs_base;
-            rsp->data.regs.x86.gs_sel = vmec.data.regs.x86.gs_sel;
-            rsp->data.regs.x86.gs.ar = vmec.data.regs.x86.gs_arbytes;
-            rsp->data.regs.x86.gs.limit = vmec.data.regs.x86.gs_limit;
-            rsp->data.regs.x86.cs_base = vmec.data.regs.x86.cs_base;
-            rsp->data.regs.x86.cs_sel = vmec.data.regs.x86.cs_sel;
-            rsp->data.regs.x86.cs.ar = vmec.data.regs.x86.cs_arbytes;
-            rsp->data.regs.x86.cs.limit = vmec.data.regs.x86.cs_limit;
-            rsp->data.regs.x86.ds_base = vmec.data.regs.x86.ds_base;
-            rsp->data.regs.x86.ds_sel = vmec.data.regs.x86.ds_sel;
-            rsp->data.regs.x86.ds.ar = vmec.data.regs.x86.ds_arbytes;
-            rsp->data.regs.x86.ds.limit = vmec.data.regs.x86.ds_limit;
-            rsp->data.regs.x86.es_base = vmec.data.regs.x86.es_base;
-            rsp->data.regs.x86.es_sel = vmec.data.regs.x86.es_sel;
-            rsp->data.regs.x86.es.ar = vmec.data.regs.x86.es_arbytes;
-            rsp->data.regs.x86.es.limit = vmec.data.regs.x86.es_limit;
-            rsp->data.regs.x86.ss_base = vmec.data.regs.x86.ss_base;
-            rsp->data.regs.x86.ss_sel = vmec.data.regs.x86.ss_sel;
-            rsp->data.regs.x86.ss.ar = vmec.data.regs.x86.ss_arbytes;
-            rsp->data.regs.x86.ss.limit = vmec.data.regs.x86.ss_limit;
-            rsp->data.regs.x86._pad = 0;
-#endif
-        }
-
+        encode_response_v7(&vmec, rsp);
         processed++;
         RING_PUSH_RESPONSES(&xe->back_ring_7);
 
@@ -3352,6 +3727,15 @@ status_t init_events_7(vmi_instance_t vmi)
     BACK_RING_INIT(&xe->back_ring_7,
                    (vm_event_7_sring_t *)xe->ring_page,
                    XC_PAGE_SIZE);
+
+    if (g_strcmp0(g_getenv("LIBVMI_VCPU_BATCH"), "1") == 0) {
+        xe->vcpu_batch = xen_vcpu_batch_create(vmi, TRUE);
+        if (!xe->vcpu_batch)
+            return VMI_FAILURE;
+        fprintf(stderr, "LibVMI: v7 per-vCPU workers ON "
+                        "(%u workers; callbacks serialized)\n",
+                vmi->num_vcpus);
+    }
 
     return VMI_SUCCESS;
 }
@@ -3687,6 +4071,7 @@ status_t xen_init_events(
     xe->process_event[VM_EVENT_REASON_IO_INSTRUCTION] = &process_io_instruction;
 
     vmi->driver.events_listen_ptr = &xen_events_listen;
+    vmi->driver.events_set_parallel_ptr = &xen_events_set_parallel;
     vmi->driver.set_reg_access_ptr = &xen_set_reg_access;
     vmi->driver.set_intr_access_ptr = &xen_set_intr_access;
     vmi->driver.set_mem_access_ptr = &xen_set_mem_access;
@@ -3794,6 +4179,11 @@ void xen_events_destroy(vmi_instance_t vmi)
 
     if ( driver_are_events_pending(vmi) )
         xen_events_listen(vmi, 0);
+
+    // All requests have been answered, the workers are idle
+    xen_vcpu_batch_shutdown(xe->vcpu_batch);
+    xe->vcpu_batch = NULL;
+    vmi->parallel_events = FALSE;
 
     // Shutdown all events to make sure VM is in a stable state
     if ( g_hash_table_size(vmi->mem_events_on_gfn) || g_hash_table_size(vmi->mem_events_generic) )

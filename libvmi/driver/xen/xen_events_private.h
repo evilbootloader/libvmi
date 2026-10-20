@@ -130,6 +130,8 @@ typedef struct {
         vm_event_7_back_ring_t back_ring_7;
     };
     xen_pfn_t max_gpfn;
+    /* Experimental, v7-only per-vCPU batch dispatcher, NULL by default. */
+    struct xen_vcpu_batch *vcpu_batch;
     uint32_t monitor_capabilities;
     bool monitor_singlestep_on;
     bool monitor_mem_access_on;

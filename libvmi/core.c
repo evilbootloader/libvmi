@@ -637,6 +637,7 @@ status_t vmi_init(
 
     _vmi->init_flags = init_flags;
     _vmi->page_mode = VMI_PM_UNKNOWN;
+    g_rw_lock_init(&_vmi->events_lock);
 
     _vmi->last_pagetable_lookup_fault.valid = false;
     _vmi->last_pagetable_lookup_fault.ctx.version = ACCESS_CONTEXT_VERSION;
@@ -1027,6 +1028,7 @@ vmi_destroy(
     if (vmi->image_type)
         free(vmi->image_type);
     g_free(vmi->memmap);
+    g_rw_lock_clear(&vmi->events_lock);
     g_free(vmi);
     return VMI_SUCCESS;
 }
