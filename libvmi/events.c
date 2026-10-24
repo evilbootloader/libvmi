@@ -91,6 +91,30 @@ void step_event_free(vmi_event_t *event, status_t rc)
         g_slice_free(vmi_event_t, event);
 }
 
+/*
+ * With parallel events a callback gets a private copy of the registered event
+ * on the stack of its worker thread, which is gone once the request has been
+ * answered. vmi_clear_event() and vmi_swap_events() keep the event they are
+ * given until no callback runs and then pass it to the free routine, so they
+ * act on the registered event instead, as they do with serial events.
+ */
+static GPrivate callback_copy = G_PRIVATE_INIT(NULL);
+static GPrivate callback_registered = G_PRIVATE_INIT(NULL);
+
+void events_set_callback_copy(vmi_event_t *copy, vmi_event_t *registered)
+{
+    g_private_set(&callback_copy, copy);
+    g_private_set(&callback_registered, registered);
+}
+
+static vmi_event_t *registered_event(vmi_event_t *event)
+{
+    if ( event && event == g_private_get(&callback_copy) )
+        return g_private_get(&callback_registered);
+
+    return event;
+}
+
 status_t events_init(vmi_instance_t vmi)
 {
     switch (vmi->mode) {
@@ -830,6 +854,12 @@ vmi_swap_events(
     }
 #endif
 
+    swap_from = registered_event(swap_from);
+    if (registered_event(swap_to) != swap_to) {
+        errprint("%s: can't swap to the copy of the event a parallel callback got\n", __FUNCTION__);
+        return VMI_FAILURE;
+    }
+
     if (swap_from->type == swap_to->type && swap_from->type == VMI_EVENT_MEMORY) {
         events_write_lock(vmi);
 
@@ -918,6 +948,11 @@ vmi_register_event(
     }
 #endif
 
+    if (registered_event(event) != event) {
+        errprint("%s: can't register the copy of the event a parallel callback got\n", __FUNCTION__);
+        return VMI_FAILURE;
+    }
+
     events_write_lock(vmi);
 
     switch (event->type) {
@@ -988,6 +1023,8 @@ status_t vmi_clear_event(
     if (!event)
         return VMI_FAILURE;
 #endif
+
+    event = registered_event(event);
 
     /*
      * We can't clear events when in an event callback rigt away
@@ -1180,6 +1217,12 @@ status_t vmi_events_set_parallel(vmi_instance_t vmi, bool enable)
 
     if (enable && vmi->parallel_events)
         return VMI_SUCCESS;
+
+    /* step_and_reg_events() changes the step list of all vCPUs without a lock */
+    if (enable && vmi->step_events) {
+        errprint("%s: events stepped with vmi_step_event are still pending\n", __FUNCTION__);
+        return VMI_FAILURE;
+    }
 
     return driver_events_set_parallel(vmi, enable);
 }

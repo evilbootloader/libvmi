@@ -845,9 +845,15 @@ status_t vmi_events_listen(
  * Events of one vCPU are always delivered on the same worker thread and in
  * order, events of different vCPUs are delivered concurrently. Each callback
  * receives a private copy of the registered vmi_event_t, so changes made to
- * the event structure inside a callback only affect that response.
+ * the event structure inside a callback only affect that response. The copy
+ * is only valid until the callback returns: given the copy, vmi_clear_event()
+ * and vmi_swap_events() act on the registered event and pass that one to the
+ * free routine, and vmi_register_event() refuses it.
  * vmi_events_listen() returns only once all requests it took from the ring
  * have been answered and no callback is running.
+ *
+ * vmi_step_event() is not supported with parallel events, which can't be
+ * enabled while events stepped with it are pending.
  *
  * Callbacks are responsible for their own locking. LibVMI does not make the
  * memory access functions safe to call concurrently on one instance, see

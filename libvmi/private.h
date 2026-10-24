@@ -403,6 +403,9 @@ gboolean clear_events_full(
     gpointer key,
     gpointer value,
     gpointer data);
+void events_set_callback_copy(
+    vmi_event_t *copy,
+    vmi_event_t *registered);
 
 #define ghashtable_foreach(table, iter, key, val) \
         g_hash_table_iter_init(&iter, table); \

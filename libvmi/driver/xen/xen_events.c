@@ -742,7 +742,8 @@ static inline void callback_end(vmi_instance_t vmi)
  * event, so that the events of other vCPUs processed at the same time don't
  * overwrite the data in it. Look the registered event up with the events lock
  * held. It stays valid afterwards because clearing an event is deferred while
- * callbacks are running.
+ * callbacks are running. The copy doesn't, so the event functions that keep
+ * the event they are given look the registered one up from the copy.
  */
 static inline vmi_event_t *event_for_callback(vmi_instance_t vmi, vmi_event_t *registered, vmi_event_t *copy)
 {
@@ -750,6 +751,7 @@ static inline vmi_event_t *event_for_callback(vmi_instance_t vmi, vmi_event_t *r
         return registered;
 
     *copy = *registered;
+    events_set_callback_copy(copy, registered);
     return copy;
 }
 
@@ -3475,6 +3477,7 @@ static gpointer xen_vcpu_worker_main(gpointer opaque)
         callback_begin(vmi);
         job->result = process_request(vmi, &job->vmec);
         callback_end(vmi);
+        events_set_callback_copy(NULL, NULL);
 
         if (batch->serialize_callbacks)
             g_mutex_unlock(&batch->callback_lock);
