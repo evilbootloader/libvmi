@@ -791,7 +791,17 @@ void process_response ( event_response_t response, vmi_event_t *event, vm_event_
                                    &event->emul_read->data,
                                    rsp->data.emul.read.size);
 
-                            if ( !event->emul_read->dont_free ) {
+                            /*
+                             * Not freed when it is the registered event's: with
+                             * parallel events `event` is a copy, and freeing
+                             * through the copy left the registered event's
+                             * pointer dangling for the next copy to free again
+                             * (review L-19). What the callback set on its copy
+                             * is freed as before; what the user set on the
+                             * registered event stays the user's.
+                             */
+                            if ( !event->emul_read->dont_free
+                                 && event->emul_read != events_registered_event(event)->emul_read ) {
                                 free(event->emul_read);
                                 event->emul_read = NULL;
                             }
@@ -805,7 +815,8 @@ void process_response ( event_response_t response, vmi_event_t *event, vm_event_
                                    &event->emul_insn->data,
                                    sizeof(rsp->data.emul.insn.data));
 
-                            if ( !event->emul_insn->dont_free ) {
+                            if ( !event->emul_insn->dont_free
+                                 && event->emul_insn != events_registered_event(event)->emul_insn ) {
                                 free(event->emul_insn);
                                 event->emul_insn = NULL;
                             }
@@ -3401,6 +3412,14 @@ static void encode_response_v7(const vm_event_compat_t *vmec,
  * library user may change the state its callbacks share. To reach that point
  * regularly under load the listener stops taking new requests after a budget.
  *
+ * The budget leaves requests on the ring: the ones the vCPUs placed after the
+ * listener stopped taking them, and the ones vCPUs blocked on a full ring
+ * (vm_event_wait_slot) place as the answers free slots. Where the ring must be
+ * empty afterwards, because the events those requests belong to are about to
+ * be cleared or destroyed, xe->drain_requests takes them all: no budget, no
+ * deadline. The callers set it with the domain paused or gone, so no vCPU
+ * places more than the one request it is blocked on and the drain ends.
+ *
  * vmi_events_set_parallel() starts the workers. LIBVMI_VCPU_BATCH=1 starts
  * them at init but keeps the callbacks serialized, for debugging.
  */
@@ -3411,6 +3430,36 @@ static void encode_response_v7(const vm_event_compat_t *vmec,
 typedef struct xen_vcpu_batch xen_vcpu_batch_t;
 
 status_t process_requests_7(vmi_instance_t vmi, uint32_t *requests_processed);
+
+/*
+ * The response to a request this library will not process: the header
+ * copied back, so that Xen resumes the vCPU that placed it, and nothing else.
+ * The caller consumes the request and holds whatever lock guards the ring.
+ */
+static void answer_invalid_request_7(xen_events_t *xe, const vm_event_7_request_t *req)
+{
+    vm_event_7_back_ring_t *ring = &xe->back_ring_7;
+    vm_event_7_response_t *rsp = RING_GET_RESPONSE(ring, ring->rsp_prod_pvt);
+
+    memset(rsp, 0, sizeof(*rsp));
+    rsp->version = req->version;
+    rsp->flags = req->flags & VM_EVENT_FLAG_VCPU_PAUSED;
+    rsp->reason = req->reason;
+    rsp->vcpu_id = req->vcpu_id;
+    ring->rsp_prod_pvt++;
+    RING_PUSH_RESPONSES(ring);
+}
+
+/*
+ * Shared by the listener, the workers and the clone readers: xce_handle
+ * (xc_evtchn_notify from every worker, poll/pending/unmask from the listener
+ * only), the xc handle and the foreign memory handle behind the reads. None
+ * of the three is documented thread-safe. xenevtchn.h warns against sharing
+ * a handle between threads that poll it, which only the listener does; the
+ * workers' notify is one ioctl each, and the reads are mmap and munmap of
+ * foreign pages, both serialised in the kernel. That is the assumption this
+ * design rests on and it has not been proven beyond running (review L-18).
+ */
 
 typedef struct xen_vcpu_job {
     vm_event_compat_t vmec;
@@ -3554,6 +3603,7 @@ static status_t process_requests_7_parallel(vmi_instance_t vmi, uint32_t *reques
     xen_events_t *xe = xen_get_events(vmi);
     vm_event_7_back_ring_t *ring = &xe->back_ring_7;
     xen_vcpu_batch_t *batch = xe->vcpu_batch;
+    const gboolean drain = xe->drain_requests;
     const uint32_t budget = batch->n_vcpus * PARALLEL_REQUESTS_PER_VCPU;
     const gint64 deadline = g_get_monotonic_time() + PARALLEL_LISTEN_BUDGET_US;
     uint32_t taken = 0, inflight = 0;
@@ -3561,7 +3611,7 @@ static status_t process_requests_7_parallel(vmi_instance_t vmi, uint32_t *reques
     status_t result = VMI_SUCCESS;
 
     for (;;) {
-        while (accept && taken < budget) {
+        while (accept && (drain || taken < budget)) {
             /* Workers move rsp_prod_pvt, which bounds the unconsumed requests */
             g_mutex_lock(&batch->ring_lock);
             int pending = RING_HAS_UNCONSUMED_REQUESTS(ring);
@@ -3574,6 +3624,17 @@ static status_t process_requests_7_parallel(vmi_instance_t vmi, uint32_t *reques
             if (req->version != 0x00000007 || req->vcpu_id >= batch->n_vcpus) {
                 errprint("Invalid v7 event version/vCPU (0x%x/%u)\n",
                          req->version, req->vcpu_id);
+                /*
+                 * Consumed and answered all the same, or it stays at the
+                 * head of the ring for every listen after this one and the
+                 * vCPU that placed it waits forever (review L-17). Only the
+                 * header is read, which every ring version lays out alike.
+                 */
+                g_mutex_lock(&batch->ring_lock);
+                answer_invalid_request_7(xe, req);
+                g_mutex_unlock(&batch->ring_lock);
+                ++ring->req_cons;
+                ring->sring->req_event = ring->req_cons + 1;
                 result = VMI_FAILURE;
                 accept = FALSE;
                 break;
@@ -3606,7 +3667,7 @@ static status_t process_requests_7_parallel(vmi_instance_t vmi, uint32_t *reques
             job = g_async_queue_try_pop(batch->done_queue);
         }
 
-        if (g_get_monotonic_time() >= deadline)
+        if (!drain && g_get_monotonic_time() >= deadline)
             accept = FALSE;
     }
 
@@ -3668,6 +3729,17 @@ status_t process_requests_7(vmi_instance_t vmi, uint32_t *requests_processed)
         if ( req->version != 0x00000007 ) {
             errprint("Error, Xen reports a VM_EVENT_INTERFACE_VERSION that is different then what we expect (0x%x != 0x%x)!\n",
                      req->version, 0x00000007);
+            /*
+             * The request is consumed already (ring_get_request_and_response_7);
+             * answered too, or the vCPU that placed it waits forever (review L-17).
+             */
+            memset(rsp, 0, sizeof(*rsp));
+            rsp->version = req->version;
+            rsp->flags = req->flags & VM_EVENT_FLAG_VCPU_PAUSED;
+            rsp->reason = req->reason;
+            rsp->vcpu_id = req->vcpu_id;
+            RING_PUSH_RESPONSES(&xe->back_ring_7);
+            xen->libxcw.xc_evtchn_notify(xe->xce_handle, xe->port);
             return VMI_FAILURE;
         }
 
@@ -3857,9 +3929,19 @@ status_t xen_events_listen(vmi_instance_t vmi, uint32_t timeout)
      */
     if ( vmi->swap_events || (vmi->clear_events && g_hash_table_size(vmi->clear_events)) ) {
         uint32_t requests_processed_extra = 0;
-        vmi_pause_vm(vmi);
+        bool drain_before = xe->drain_requests;
+        status_t paused = vmi_pause_vm(vmi);
 
+        /*
+         * Paused, no vCPU places a request that is not already on its way,
+         * so the parallel dispatcher may take them all: one left behind would
+         * reach the next listen with its event gone. Not paused (the domain
+         * is going away), the budget keeps this from spinning on a ring that
+         * keeps filling.
+         */
+        xe->drain_requests = drain_before || VMI_SUCCESS == paused;
         vrc = xe->process_requests(vmi, &requests_processed_extra);
+        xe->drain_requests = drain_before;
 #ifdef ENABLE_SAFETY_CHECKS
         if ( VMI_FAILURE == vrc )
             return VMI_FAILURE;
@@ -4180,8 +4262,15 @@ void xen_events_destroy(vmi_instance_t vmi)
         resume = 1;
     }
 
+    /*
+     * Paused here or before, or gone: the ring gets nothing new, so the
+     * listen below may take every request on it. The workers are shut down
+     * right after and a request left on the ring would never be answered.
+     */
+    xe->drain_requests = resume || rc != 1 || info.domain != dom || (info.flags & XEN_DOMINF_paused);
     if ( driver_are_events_pending(vmi) )
         xen_events_listen(vmi, 0);
+    xe->drain_requests = false;
 
     // All requests have been answered, the workers are idle
     xen_vcpu_batch_shutdown(xe->vcpu_batch);

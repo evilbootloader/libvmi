@@ -406,6 +406,9 @@ gboolean clear_events_full(
 void events_set_callback_copy(
     vmi_event_t *copy,
     vmi_event_t *registered);
+/* The registered event behind a callback's copy; any other event as is */
+vmi_event_t *events_registered_event(
+    vmi_event_t *event);
 
 #define ghashtable_foreach(table, iter, key, val) \
         g_hash_table_iter_init(&iter, table); \

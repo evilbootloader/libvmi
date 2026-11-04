@@ -115,6 +115,11 @@ static vmi_event_t *registered_event(vmi_event_t *event)
     return event;
 }
 
+vmi_event_t *events_registered_event(vmi_event_t *event)
+{
+    return registered_event(event);
+}
+
 status_t events_init(vmi_instance_t vmi)
 {
     switch (vmi->mode) {

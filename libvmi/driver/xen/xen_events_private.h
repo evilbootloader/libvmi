@@ -132,6 +132,14 @@ typedef struct {
     xen_pfn_t max_gpfn;
     /* Experimental, v7-only per-vCPU batch dispatcher, NULL by default. */
     struct xen_vcpu_batch *vcpu_batch;
+    /*
+     * While set, the parallel dispatcher takes requests until the ring is
+     * empty and every one is answered, with no budget and no deadline. Set by
+     * the callers that need the ring empty afterwards, with the domain paused
+     * or gone so that it terminates: applying deferred clears and swaps, and
+     * destroying the events.
+     */
+    bool drain_requests;
     uint32_t monitor_capabilities;
     bool monitor_singlestep_on;
     bool monitor_mem_access_on;
