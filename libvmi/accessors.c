@@ -759,6 +759,22 @@ void* vmi_read_page (vmi_instance_t vmi, addr_t frame_num)
     return driver_read_page(vmi, frame_num);
 }
 
+status_t vmi_get_domain_status(vmi_instance_t vmi, domain_status_t *domain_status)
+{
+#ifdef ENABLE_SAFETY_CHECKS
+    if (!vmi) {
+        errprint("NULL vmi passed to vmi_get_domain_status\n");
+        return VMI_FAILURE;
+    }
+    if (!domain_status) {
+        errprint("NULL domain_status_t passed to vmi_get_domain_status\n");
+        return VMI_FAILURE;
+    }
+#endif
+
+    return driver_get_domain_status(vmi, domain_status);
+}
+
 GSList* vmi_get_va_pages(vmi_instance_t vmi, addr_t dtb)
 {
 #ifdef ENABLE_SAFETY_CHECKS
@@ -845,7 +861,7 @@ status_t vmi_nested_pagetable_lookup (
         }
     }
 
-    page_info_t info;
+    page_info_t info = {0};
 
     if (VMI_FAILURE == vmi->arch_interface.lookup[pm](vmi, npt, npm, pt, vaddr, &info)) {
         vmi->last_pagetable_lookup_fault.ctx.pm = pm;

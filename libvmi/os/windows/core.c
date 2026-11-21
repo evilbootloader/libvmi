@@ -24,6 +24,8 @@
  * along with LibVMI.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <assert.h>
+
 #include "private.h"
 #include "libvmi/peparse.h"
 #include "os/windows/windows.h"
@@ -62,7 +64,6 @@ win_ver_t ntbuild2version(uint16_t ntbuildnumber)
     return VMI_OS_WINDOWS_UNKNOWN;
 };
 
-static inline
 win_ver_t pe2version(vmi_instance_t vmi, addr_t kernbase_pa, uint16_t* major, uint16_t* minor)
 {
     // Clear in/out
@@ -118,6 +119,7 @@ win_ver_t pe2version(vmi_instance_t vmi, addr_t kernbase_pa, uint16_t* major, ui
                 case 1:
                     return VMI_OS_WINDOWS_7;
                 case 2:
+                case 3:
                     return VMI_OS_WINDOWS_8;
             };
             break;
@@ -665,17 +667,13 @@ find_windows_version_from_json_profile(vmi_instance_t vmi)
 {
     status_t ret = VMI_FAILURE;
     windows_instance_t windows = vmi->os_data;
-    addr_t ntbuildnumber_rva;
     uint16_t ntbuildnumber = 0;
 
     // Let's do some sanity checking
     if (!windows->ntoskrnl)
         goto done;
 
-    if (VMI_FAILURE == json_profile_lookup(vmi, "NtBuildNumber", NULL, &ntbuildnumber_rva)) {
-        goto done;
-    }
-    if (VMI_FAILURE == vmi_read_16_pa(vmi, windows->ntoskrnl + ntbuildnumber_rva, &ntbuildnumber)) {
+    if (VMI_FAILURE == vmi_read_16_ksym(vmi, "NtBuildNumber", &ntbuildnumber)) {
         goto done;
     }
 
@@ -819,15 +817,15 @@ static status_t kpcr_find3(vmi_instance_t vmi, windows_instance_t windows)
 {
     dbprint(VMI_DEBUG_MISC, "** Trying kpcr_find3\n");
 
-    addr_t int0_rva = 0;
+    /* With KVA shadowing (the Meltdown mitigation) the IDT in use while a vCPU runs user
+     * code points to the trampolines of the shadow section, not to the handlers, so the
+     * RVA of both are tried and the one giving a kernel base with a PE header wins. */
+    static const char *int0_symbols[] = {
+        "KiDivideErrorFault", "KiTrap00", "KiDivideErrorFaultShadow", "KiTrap00Shadow"
+    };
     reg_t idt = 0;
     uint32_t int0_high = 0;
     uint16_t int0_low = 0, int0_middle = 0;
-
-    if ( VMI_FAILURE == json_profile_lookup(vmi, "KiDivideErrorFault", NULL, &int0_rva) ) {
-        if ( VMI_FAILURE == json_profile_lookup(vmi, "KiTrap00", NULL, &int0_rva) )
-            return VMI_FAILURE;
-    }
 
     // Some Windows10+ JSON profiles don't have KiInitialPCR defined so we use the IDT route
     // For the layout of the IDT entry see http://wiki.osdev.org/Interrupt_Descriptor_Table
@@ -840,9 +838,26 @@ static status_t kpcr_find3(vmi_instance_t vmi, windows_instance_t windows)
     if (VMI_PM_IA32E == vmi->page_mode && VMI_FAILURE == vmi_read_32_va(vmi, idt + 8, 0, &int0_high))
         return VMI_FAILURE;
 
-    windows->ntoskrnl_va = (((uint64_t)int0_high << 32) | ((uint64_t)int0_middle << 16) | int0_low) - int0_rva;
+    addr_t int0 = ((uint64_t)int0_high << 32) | ((uint64_t)int0_middle << 16) | int0_low;
 
-    return VMI_SUCCESS;
+    for (size_t i = 0; i < sizeof(int0_symbols) / sizeof(int0_symbols[0]); i++) {
+        addr_t int0_rva = 0, base = 0;
+        uint16_t mz = 0;
+
+        if ( VMI_FAILURE == json_profile_lookup(vmi, int0_symbols[i], NULL, &int0_rva) || int0_rva > int0 )
+            continue;
+
+        base = int0 - int0_rva;
+        if ( (base & VMI_BIT_MASK(0, 11)) || !windows_is_kernel_address(vmi, base) )
+            continue;
+        if ( VMI_FAILURE == vmi_read_16_va(vmi, base, 0, &mz) || mz != 0x5a4d ) /* "MZ" */
+            continue;
+
+        windows->ntoskrnl_va = base;
+        return VMI_SUCCESS;
+    }
+
+    return VMI_FAILURE;
 }
 
 static status_t kpcr_find4(vmi_instance_t vmi, windows_instance_t windows, reg_t kpcr_reg)
@@ -1043,12 +1058,197 @@ done:
 static status_t
 init_core(vmi_instance_t vmi)
 {
+    /* A live guest with paging disabled (e.g. still in its firmware or boot
+     * loader) cannot be running the Windows kernel yet. Every method below
+     * would fail, the KdDebuggerDataBlock search only after scanning all of
+     * physical memory, so give up right away and let the caller retry once
+     * the guest has booted. */
+    if ( VMI_FILE != vmi->mode && VMI_PM_NONE == vmi->page_mode ) {
+        errprint("Guest paging is disabled, the Windows kernel is not running yet; retry once the guest has booted\n");
+        return VMI_FAILURE;
+    }
+
     status_t ret = init_from_json_profile(vmi);
 
     if ( VMI_FAILURE == ret )
         ret = init_from_kdbg(vmi);
 
     return ret;
+}
+
+static status_t
+windows_init_pte(vmi_instance_t vmi)
+{
+#ifdef ENABLE_JSON_PROFILES
+    windows_instance_t windows = vmi->os_data;
+    json_object *json = vmi_get_kernel_json(vmi);
+
+    size_t start_bit, end_bit;
+
+    if (VMI_FAILURE == vmi_get_bitfield_offset_and_size_from_json(vmi, json, "_MMPTE_SOFTWARE", "Protection", 0, &start_bit, &end_bit)) {
+        dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: unable to get \"_MMPTE_SOFTWARE::Protection\" info\n");
+        return VMI_FAILURE;
+    }
+
+    windows->pte_info.soft_prot_mask = VMI_BIT_MASK(start_bit, end_bit - 1);
+    dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: \"_MMPTE_SOFTWARE::Protection\" bitfield mask = 0x%.16"PRIx64"\n", windows->pte_info.soft_prot_mask);
+
+    if (VMI_FAILURE == vmi_get_bitfield_offset_and_size_from_json(vmi, json, "_MMPTE_SOFTWARE", "PageFileHigh", 0, &start_bit, &end_bit)) {
+        dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: unable to get \"_MMPTE_SOFTWARE::PageFileHigh\" info\n");
+        return VMI_FAILURE;
+    }
+
+    windows->pte_info.soft_pagehigh_mask = VMI_BIT_MASK(start_bit, end_bit - 1);
+    dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: \"_MMPTE_SOFTWARE::PageFileHigh\" bitfield mask = 0x%.16"PRIx64"\n", windows->pte_info.soft_pagehigh_mask);
+
+    if (VMI_FAILURE == vmi_get_bitfield_offset_and_size_from_json(vmi, json, "_MMPTE_PROTOTYPE", "ProtoAddress", 0, &windows->pte_info.proto_protoaddr_start_bit, &end_bit)) {
+        dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: unable to get \"_MMPTE_PROTOTYPE::ProtoAddress\" info\n");
+        return VMI_FAILURE;
+    }
+
+    windows->pte_info.proto_protoaddr_mask = VMI_BIT_MASK(windows->pte_info.proto_protoaddr_start_bit, end_bit - 1);
+    dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: \"_MMPTE_PROTOTYPE::ProtoAddress\" bitfield mask = 0x%.16"PRIx64"\n", windows->pte_info.proto_protoaddr_mask);
+
+    if (VMI_FAILURE == vmi_get_bitfield_offset_and_size_from_json(vmi, json, "_MMPTE_HARDWARE", "PageFrameNumber", 0, &windows->pte_info.hard_pfn_start_bit, 0)) {
+        dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: unable to get \"_MMPTE_HARDWARE::PageFrameNumber\" info\n");
+        return VMI_FAILURE;
+    }
+
+    if (VMI_FAILURE == vmi_get_bitfield_offset_and_size_from_json(vmi, json, "_MMPTE_TRANSITION", "PageFrameNumber", 0, &windows->pte_info.trans_pfn_start_bit, 0)) {
+        dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: unable to get \"_MMPTE_TRANSITION::PageFrameNumber\" info\n");
+        return VMI_FAILURE;
+    }
+
+    // The SwizzleBit field for _MMPTE_PROTOTYPE, _MMPTE_SOFTWARE and _MMPTE_TRANSITION is the same
+    // due to simple logic of MiSwizzleInvalidPte()
+    if (VMI_SUCCESS == vmi_get_bitfield_offset_and_size_from_json(vmi, json, "_MMPTE_PROTOTYPE", "SwizzleBit", 0, &start_bit, &end_bit)) {
+        windows->pte_info.swizzle_mask = VMI_BIT_MASK(start_bit, end_bit - 1);
+        dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: \"_MMPTE_PROTOTYPE::SwizzleBit\" bitfield mask = 0x%.16"PRIx64"\n", windows->pte_info.swizzle_mask);
+    }
+
+    size_t mi_state_address;
+    if (VMI_SUCCESS == vmi_translate_ksym2v(vmi, "MiState", &mi_state_address)) {
+
+        addr_t offset_hardware;
+        addr_t offset_invalid_pte_mask;
+
+        if (VMI_FAILURE == vmi_get_struct_member_offset_from_json(vmi, json, "_MI_SYSTEM_INFORMATION", "Hardware", &offset_hardware)) {
+            dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: unable to get \"_MI_SYSTEM_INFORMATION::Hardware\" offset\n");
+            return VMI_FAILURE;
+        }
+
+        if (VMI_SUCCESS == vmi_get_struct_member_offset_from_json(vmi, json, "_MI_HARDWARE_STATE", "InvalidPteMask", &offset_invalid_pte_mask)) {
+
+            if (VMI_FAILURE == vmi_read_64_va(vmi, mi_state_address + offset_hardware + offset_invalid_pte_mask, 0, &windows->pte_info.invalid_pte_mask)) {
+                dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: unable to read \"InvalidPteMask\" value\n");
+                return VMI_FAILURE;
+            }
+
+            dbprint(VMI_DEBUG_PTERESOLVE, "--PTEResolve: \"InvalidPteMask\" value = 0x%.16"PRIx64"\n", windows->pte_info.invalid_pte_mask);
+
+            windows->pte_info.proto_invalid_mask = ~(windows->pte_info.invalid_pte_mask >> windows->pte_info.proto_protoaddr_start_bit);
+            windows->pte_info.trans_invalid_mask = ~((windows->pte_info.invalid_pte_mask >> windows->pte_info.trans_pfn_start_bit) << vmi->page_shift);
+        }
+    }
+
+    static size_t maxphysaddr = 45;
+
+    windows->pte_info.hard_pfn_mask = VMI_BIT_MASK(0, maxphysaddr - 1);
+    windows->pte_info.hard_pfn_mask ^= VMI_BIT_MASK(0, windows->pte_info.hard_pfn_start_bit - 1);
+
+    windows->pte_info.trans_pfn_mask = VMI_BIT_MASK(0, maxphysaddr - 1);
+    windows->pte_info.trans_pfn_mask ^= VMI_BIT_MASK(0, windows->pte_info.trans_pfn_start_bit - 1);
+    assert(windows->pte_info.trans_pfn_mask == 0x1ffffffff000);
+
+    assert(windows->pte_info.swizzle_mask == 0 || windows->pte_info.swizzle_mask == 0x10);
+
+    windows->pte_info.proto_vad_pte = vmi->page_mode == VMI_PM_IA32E ? 0xffffffff0000 : 0xffffffff;
+
+    return VMI_SUCCESS;
+#else
+    dbprint(VMI_DEBUG_MISC, "Need ENABLE_JSON_PROFILES for windows_init_pte\n");
+    return VMI_FAILURE;
+#endif
+}
+
+/* Is va in the kernel half of the guest address space? Before the page mode
+ * is known the guest is assumed to be 64-bit. */
+bool
+windows_is_kernel_address(
+    vmi_instance_t vmi,
+    addr_t va)
+{
+    if (VMI_PM_LEGACY == vmi->page_mode || VMI_PM_PAE == vmi->page_mode)
+        return va >= 0x80000000ULL && va < 0x100000000ULL;
+    return (va >> 47) == 0x1ffff;
+}
+
+/* Gets the CR3 of a vCPU to use during the init phase.
+ * Normally this is the CR3 of vCPU 0. But with KVA shadowing a vCPU that is running user code
+ * uses a page table without kernel mappings, so the kernel cannot be found with it (LibVMI would
+ * then fall back to searching all of physical memory, which can take minutes). So if vCPU 0 is
+ * running user code, prefer the CR3 of a vCPU that is running kernel code. */
+static status_t
+get_vcpu_kernel_cr3(
+    vmi_instance_t vmi,
+    addr_t *cr3_out)
+{
+    reg_t cr3 = 0, rip = 0;
+    unsigned int vcpu, num_vcpus;
+
+    if ( VMI_FAILURE == driver_get_vcpureg(vmi, &cr3, CR3, 0) )
+        return VMI_FAILURE;
+
+    /* RIP in the kernel half of the address space: vCPU 0 is already running kernel code */
+    if ( VMI_SUCCESS == driver_get_vcpureg(vmi, &rip, RIP, 0) && windows_is_kernel_address(vmi, rip) ) {
+        *cr3_out = cr3;
+        return VMI_SUCCESS;
+    }
+
+    num_vcpus = vmi_get_num_vcpus(vmi);
+    for (vcpu = 1; vcpu < num_vcpus; ++vcpu) {
+        reg_t other_cr3 = 0;
+        if ( VMI_SUCCESS == driver_get_vcpureg(vmi, &rip, RIP, vcpu) && windows_is_kernel_address(vmi, rip) &&
+                VMI_SUCCESS == driver_get_vcpureg(vmi, &other_cr3, CR3, vcpu) && other_cr3 ) {
+            dbprint(VMI_DEBUG_MISC, "--vCPU 0 is running user code, using the CR3 of vCPU %u\n", vcpu);
+            cr3 = other_cr3;
+            break;
+        }
+    }
+
+    *cr3_out = cr3;
+    return VMI_SUCCESS;
+}
+
+/* The CR3 taken at the start of the init phase can go stale: the KdDebuggerDataBlock
+ * search can take a while on a running guest, and if that CR3 belonged to a process that
+ * exits in the meantime, its top level page table is freed and reused, so every later
+ * translation fails. Make sure vmi->kpgd still maps kva to kpa, otherwise take the
+ * current CR3 of a vCPU that does. */
+status_t
+windows_refresh_init_cr3(
+    vmi_instance_t vmi,
+    addr_t kva,
+    addr_t kpa)
+{
+    addr_t pa = 0;
+    unsigned int vcpu, num_vcpus = vmi_get_num_vcpus(vmi);
+
+    if ( VMI_SUCCESS == vmi_pagetable_lookup(vmi, vmi->kpgd, kva, &pa) && pa == kpa )
+        return VMI_SUCCESS;
+
+    for (vcpu = 0; vcpu < num_vcpus; ++vcpu) {
+        reg_t cr3 = 0;
+        if ( VMI_SUCCESS == driver_get_vcpureg(vmi, &cr3, CR3, vcpu) && cr3 &&
+                VMI_SUCCESS == vmi_pagetable_lookup(vmi, cr3, kva, &pa) && pa == kpa ) {
+            dbprint(VMI_DEBUG_MISC, "--init CR3 0x%"PRIx64" is stale, using the CR3 of vCPU %u (0x%"PRIx64")\n",
+                    vmi->kpgd, vcpu, (addr_t)cr3);
+            vmi->kpgd = cr3;
+            return VMI_SUCCESS;
+        }
+    }
+
+    return VMI_FAILURE;
 }
 
 status_t
@@ -1106,7 +1306,7 @@ windows_init(vmi_instance_t vmi, GHashTable *config)
      * If the driver gets us a dtb, it will be used _only_ during the init phase,
      * and will be replaced by the real kpgd later. */
     if ( !vmi->kpgd ) {
-        if ( VMI_FAILURE == driver_get_vcpureg(vmi, &vmi->kpgd, CR3, 0)) {
+        if ( VMI_FAILURE == get_vcpu_kernel_cr3(vmi, &vmi->kpgd)) {
             if (VMI_FAILURE == get_kpgd_method2(vmi)) {
                 errprint("Could not get kpgd, will not be able to determine page mode\n");
                 goto done;
@@ -1125,6 +1325,9 @@ windows_init(vmi_instance_t vmi, GHashTable *config)
             goto done;
         }
     }
+
+    if (VMI_SUCCESS == windows_init_pte(vmi))
+        vmi->os_interface->os_pte_to_paddr = windows_pte_to_paddr;
 
     if (VMI_SUCCESS == real_kpgd_found) {
         status = VMI_SUCCESS;

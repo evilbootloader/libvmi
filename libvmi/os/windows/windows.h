@@ -23,6 +23,29 @@
 
 #include "private.h"
 
+struct windows_pte_info {
+
+    size_t proto_vad_pte;
+
+    uint64_t soft_prot_mask;
+    uint64_t soft_pagehigh_mask;
+
+    size_t hard_pfn_start_bit;
+    uint64_t hard_pfn_mask;
+
+    size_t trans_pfn_start_bit;
+    uint64_t trans_pfn_mask;
+
+    size_t proto_protoaddr_start_bit;
+    uint64_t proto_protoaddr_mask;
+
+    uint64_t swizzle_mask;
+
+    uint64_t invalid_pte_mask;
+    uint64_t proto_invalid_mask;
+    uint64_t trans_invalid_mask;
+};
+
 struct windows_instance {
 
     addr_t ntoskrnl; /**< base phys address for ntoskrnl image */
@@ -30,6 +53,12 @@ struct windows_instance {
     addr_t ntoskrnl_va; /**< virtual address for ntoskrnl image */
 
     addr_t kdbg_va; /**< virtual address of the KdDebuggerDataBlock */
+
+    bool kdbg_encoded; /**< KdDebuggerDataBlock is stored encoded (Windows 10+) */
+
+    uint8_t kdbg_decode_rot; /**< rotation of the KdDebuggerDataBlock encoding */
+
+    uint64_t kdbg_decode_xor; /**< constant term of the KdDebuggerDataBlock encoding */
 
     addr_t sysproc; /**< physical address for the system process */
 
@@ -52,6 +81,8 @@ struct windows_instance {
     uint16_t major; /**< Windows major number */
 
     uint16_t minor; /**< Windows minor number */
+
+    struct windows_pte_info pte_info; /**< some PTE offsets and bitwise masks */
 };
 typedef struct windows_instance *windows_instance_t;
 
@@ -59,6 +90,8 @@ status_t windows_init(vmi_instance_t instance, GHashTable *config);
 
 status_t windows_pid_to_pgd(vmi_instance_t vmi, vmi_pid_t pid, addr_t *dtb);
 status_t windows_pgd_to_pid(vmi_instance_t vmi, addr_t pgd, vmi_pid_t *pid);
+
+status_t windows_pte_to_paddr(vmi_instance_t vmi, page_info_t *info);
 
 status_t
 windows_kernel_symbol_to_address(vmi_instance_t vmi, const char *symbol,
@@ -87,6 +120,9 @@ addr_t windows_find_eprocess_list_pid(vmi_instance_t vmi, vmi_pid_t pid);
 addr_t windows_find_eprocess_list_pgd(vmi_instance_t vmi, addr_t pgd);
 
 status_t init_from_kdbg(vmi_instance_t vmi);
+status_t windows_refresh_init_cr3(vmi_instance_t vmi, addr_t kva, addr_t kpa);
+bool windows_is_kernel_address(vmi_instance_t vmi, addr_t va);
+win_ver_t pe2version(vmi_instance_t vmi, addr_t kernbase_pa, uint16_t *major, uint16_t *minor);
 status_t windows_kdbg_lookup(vmi_instance_t vmi, const char *symbol, addr_t *address);
 
 unicode_string_t *windows_read_unicode_struct(vmi_instance_t vmi, const access_context_t *ctx);

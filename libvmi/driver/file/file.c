@@ -40,10 +40,6 @@
 #include <unistd.h>
 #include <limits.h>
 
-// Use mmap() if this evaluates to true; otherwise, use a file pointer with
-// seek/read
-#define USE_MMAP 0
-
 // Avoid errors on systems that don't have MAP_POPULATE defined
 #ifndef MAP_POPULATE
 #define MAP_POPULATE 0
@@ -146,9 +142,10 @@ file_init_vmi(
 
 #if USE_MMAP
     /* try memory mapped file I/O */
-    uint64_t size = 0;
+    uint64_t ram_size = 0;
+    addr_t max_addr = 0;
 
-    if (VMI_FAILURE == file_get_memsize(vmi, &size)) {
+    if (VMI_FAILURE == file_get_memsize(vmi, &ram_size, &max_addr)) {
         goto fail;
     }   // if
 
@@ -159,7 +156,7 @@ file_init_vmi(
 #endif // MMAP_HUGETLB
 
     void *map = mmap(NULL,  // addr
-                     size,  // len
+                     ram_size,  // len
                      PROT_READ, // prot
                      mmap_flags,    // flags
                      fd,    // file descriptor
@@ -192,7 +189,7 @@ file_destroy(
 
 #if USE_MMAP
     if (fi->map) {
-        (void) munmap(fi->map, vmi->size);
+        (void) munmap(fi->map, vmi->allocated_ram_size);
         fi->map = 0;
     }
 #endif // USE_MMAP
